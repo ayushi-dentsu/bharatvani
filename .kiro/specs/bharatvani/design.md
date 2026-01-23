@@ -2,7 +2,9 @@
 
 ## Overview
 
-BharatVani is an AI-powered voice health screening system designed to provide accessible healthcare screening for rural India through phone-based interactions. The system leverages voice biomarker analysis to detect respiratory health conditions using a combination of AWS cloud services and machine learning.
+BharatVani is an AI-powered voice health screening system designed to provide accessible healthcare screening for rural India through phone-based interactions. The system leverages voice biomarker analysis to assess respiratory health risk using a combination of AWS cloud services and machine learning.
+
+**Important Medical Disclaimer:** BharatVani provides preliminary health risk screening only. It does not diagnose medical conditions. All results require professional medical evaluation and confirmation by qualified healthcare providers.
 
 The MVP focuses on demonstrating core functionality: voice collection via Amazon Connect IVR, respiratory health assessment through cough analysis, and results delivery via SMS. The architecture is designed to be scalable and extensible for future enhancements including multi-language support, additional health conditions, and integration with India's healthcare infrastructure.
 

@@ -4,7 +4,9 @@
 
 BharatVani is an AI-powered voice health screening system designed for rural India's 650 million population. The system leverages voice biomarker analysis to provide accessible healthcare screening through phone-based interactions. 
 
-**Hackathon MVP Scope:** This requirements document focuses on creating a proof-of-concept demonstration system with basic voice collection, single-condition detection (respiratory health), and results delivery. The MVP prioritizes functionality demonstration.
+**Important Medical Disclaimer:** BharatVani provides preliminary health risk screening only. It does not diagnose medical conditions. All results require professional medical evaluation and confirmation by qualified healthcare providers.
+
+**Hackathon MVP Scope:** This requirements document focuses on creating a proof-of-concept demonstration system with basic voice collection, single-condition risk assessment (respiratory health), and results delivery. The MVP prioritizes functionality demonstration.
 
 **Future Production Scope:** Post-hackathon development will focus on multi-language support, additional health conditions, clinical validation, and cost optimization for large-scale deployment.
 
@@ -19,21 +21,6 @@ BharatVani is an AI-powered voice health screening system designed for rural Ind
 - **Risk_Assessment**: Binary classification (high/low risk) with confidence scoring
 - **SMS_Notifier**: SNS-based service for delivering results via text message
 - **Demo_Dashboard**: Web-based visualization interface for hackathon demonstration
-
-### Requirement 11: Hackathon MVP Scope Definition
-
-**User Story:** As a hackathon participant, I want clear boundaries on what must be delivered for the demonstration, so that the team can focus on demonstrable core functionality.
-
-#### Acceptance Criteria
-
-1. THE Voice_Screening_System SHALL demonstrate end-to-end voice collection through Amazon Connect IVR
-2. THE Voice_Screening_System SHALL process audio for respiratory health assessment using a pre-trained or simple ML model
-3. THE Voice_Screening_System SHALL deliver results via SMS within the hackathon demonstration
-4. THE Demo_Dashboard SHALL provide real-time visualization of the screening process for judges
-5. THE Voice_Screening_System SHALL support English and Hindi voice prompts as minimum viable languages
-6. THE Voice_Screening_System SHALL handle at least 10 concurrent demo screenings during presentation
-7. WHERE advanced features like multi-language support or additional health conditions are implemented, they SHALL be marked as future enhancements beyond MVP scope
-8. THE Voice_Screening_System SHALL prioritize working demonstration over production-ready optimization during the development period
 
 ## Requirements
 
@@ -87,7 +74,7 @@ BharatVani is an AI-powered voice health screening system designed for rural Ind
 1. WHEN audio features are extracted, THE ML_Engine SHALL process them through a pre-trained respiratory health model
 2. WHEN generating predictions, THE ML_Engine SHALL provide binary Risk_Assessment (high/low risk) with confidence scores
 3. WHEN confidence is below 60%, THE ML_Engine SHALL flag the result as inconclusive and recommend re-screening
-4. WHEN high risk is detected, THE ML_Engine SHALL generate specific recommendations for immediate medical consultation
+4. WHEN high risk is identified, THE ML_Engine SHALL generate specific recommendations for immediate medical consultation
 5. THE ML_Engine SHALL complete analysis within 30 seconds of receiving processed audio features
 6. WHEN processing fails, THE ML_Engine SHALL log errors and provide fallback recommendations
 
@@ -99,7 +86,7 @@ BharatVani is an AI-powered voice health screening system designed for rural Ind
 
 1. WHEN ML analysis is complete, THE SMS_Notifier SHALL send results to the user's phone within 2 minutes
 2. WHEN sending SMS, THE Voice_Screening_System SHALL include risk level, confidence score, and next steps in local language
-3. WHEN high risk is detected, THE SMS_Notifier SHALL include emergency contact information and nearest PHC details
+3. WHEN high risk is identified, THE SMS_Notifier SHALL include emergency contact information and nearest PHC details
 4. WHEN low risk is assessed, THE SMS_Notifier SHALL provide preventive health tips and re-screening recommendations
 5. THE SMS_Notifier SHALL handle delivery failures and retry up to 3 times with exponential backoff
 6. WHEN SMS delivery fails completely, THE Voice_Screening_System SHALL log the failure for manual follow-up
