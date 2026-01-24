@@ -15,7 +15,7 @@ BharatVani is an AI-powered voice health screening system designed for rural Ind
 - **Voice_Screening_System**: The complete BharatVani platform including IVR, ML processing, and result delivery
 - **IVR_Interface**: Amazon Connect-based interactive voice response system for audio collection
 - **Audio_Processor**: Lambda-based service that processes and analyzes voice recordings
-- **ML_Engine**: SageMaker-powered machine learning service for health risk assessment
+- **ML_Engine**: Lambda-based machine learning service for health risk assessment
 - **User**: Rural Indian individual accessing the screening service via phone
 - **Health_Record**: Digital record containing user information and screening results
 - **Risk_Assessment**: Binary classification (high/low risk) with confidence scoring
@@ -71,7 +71,7 @@ BharatVani is an AI-powered voice health screening system designed for rural Ind
 
 #### Acceptance Criteria
 
-1. WHEN audio features are extracted, THE ML_Engine SHALL process them through a pre-trained respiratory health model
+1. WHEN audio features are extracted, THE ML_Engine SHALL process them through a Lambda-deployed respiratory health model
 2. WHEN generating predictions, THE ML_Engine SHALL provide binary Risk_Assessment (high/low risk) with confidence scores
 3. WHEN confidence is below 60%, THE ML_Engine SHALL flag the result as inconclusive and recommend re-screening
 4. WHEN high risk is identified, THE ML_Engine SHALL generate specific recommendations for immediate medical consultation
@@ -164,7 +164,7 @@ BharatVani is an AI-powered voice health screening system designed for rural Ind
 
 1. WHEN processing screenings, THE Voice_Screening_System SHALL implement basic cost monitoring to track AWS resource usage per screening
 2. WHEN storing data, THE Voice_Screening_System SHALL use appropriate storage classes for the hackathon demonstration
-3. WHEN running ML inference, THE ML_Engine SHALL use development-appropriate instance types with basic auto-scaling
+3. WHEN running ML inference, THE ML_Engine SHALL use Lambda functions with appropriate memory allocation and auto-scaling
 4. THE Voice_Screening_System SHALL implement efficient audio compression without compromising analysis quality
 5. THE Voice_Screening_System SHALL provide cost monitoring dashboard to track spending during development
 6. WHERE production deployment occurs, THE Voice_Screening_System SHALL support optimization strategies to achieve sustainable per-screening costs through scale and efficiency improvements

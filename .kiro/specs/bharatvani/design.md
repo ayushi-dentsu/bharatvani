@@ -2,83 +2,45 @@
 
 ## Overview
 
-BharatVani is an AI-powered voice health screening system designed to provide accessible healthcare screening for rural India through phone-based interactions. The system leverages voice biomarker analysis to assess respiratory health risk using a combination of AWS cloud services and machine learning.
+BharatVani is an AI-powered voice health screening system designed to provide accessible healthcare screening for rural India through phone-based interactions. The system leverages voice biomarker analysis to assess respiratory health risk using a combination of AWS cloud services and serverless machine learning.
 
 **Important Medical Disclaimer:** BharatVani provides preliminary health risk screening only. It does not diagnose medical conditions. All results require professional medical evaluation and confirmation by qualified healthcare providers.
 
-The MVP focuses on demonstrating core functionality: voice collection via Amazon Connect IVR, respiratory health assessment through cough analysis, and results delivery via SMS. The architecture is designed to be scalable and extensible for future enhancements including multi-language support, additional health conditions, and integration with India's healthcare infrastructure.
+The MVP focuses on demonstrating core functionality: voice collection via Amazon Connect IVR, respiratory health assessment through cough analysis using Lambda-based ML inference, and results delivery via SMS. The architecture is designed to be cost-effective and scalable, utilizing serverless technologies for optimal resource utilization and minimal operational overhead.
 
 ### Key Design Principles
 
 1. **Accessibility First**: Phone-based interaction requiring no smartphone or internet access for users
-2. **Scalable Architecture**: Microservices design supporting horizontal scaling from hundreds to millions of users
+2. **Serverless Architecture**: Lambda-based processing for automatic scaling and cost optimization
 3. **Privacy by Design**: Encryption at rest and in transit, automatic data deletion, minimal data retention
-4. **Cost Optimization**: Pay-per-use AWS services with auto-scaling to minimize operational costs
+4. **Cost Optimization**: Pay-per-use serverless services with no minimum charges
 5. **Clinical Validation Ready**: Data collection and analysis pipeline designed for future clinical studies
 
 ## Architecture
 
 ### High-Level System Architecture
 
-```mermaid
-graph TB
-    subgraph "User Interface Layer"
-        Phone[Rural User Phone]
-        Dashboard[Demo Dashboard]
-    end
-    
-    subgraph "AWS Cloud Infrastructure"
-        subgraph "Communication Layer"
-            Connect[Amazon Connect IVR]
-            SNS[Amazon SNS SMS]
-        end
-        
-        subgraph "Processing Layer"
-            Lambda1[Audio Processing Lambda]
-            Lambda2[ML Inference Lambda]
-            Lambda3[Results Processing Lambda]
-        end
-        
-        subgraph "ML & Analytics"
-            SageMaker[SageMaker Endpoint]
-            Comprehend[Comprehend Medical]
-        end
-        
-        subgraph "Storage Layer"
-            S3[S3 Audio Storage]
-            DynamoDB[DynamoDB Records]
-        end
-        
-        subgraph "Monitoring & Security"
-            CloudWatch[CloudWatch Logs]
-            IAM[IAM Roles]
-        end
-    end
-    
-    Phone --> Connect
-    Connect --> Lambda1
-    Lambda1 --> S3
-    Lambda1 --> Lambda2
-    Lambda2 --> SageMaker
-    Lambda2 --> Lambda3
-    Lambda3 --> SNS
-    Lambda3 --> DynamoDB
-    Dashboard --> DynamoDB
-    Dashboard --> S3
-    
-    CloudWatch --> Lambda1
-    CloudWatch --> Lambda2
-    CloudWatch --> Lambda3
-```
+The BharatVani system utilizes a serverless architecture built on AWS Lambda functions for optimal cost efficiency and automatic scaling. The system processes voice calls through Amazon Connect, analyzes audio using Lambda-based ML inference, and delivers results via SMS.
 
-### Service Integration Flow
+**Key Architecture Benefits:**
+- **Cost Optimization**: Pay-per-execution model with no minimum charges
+- **Automatic Scaling**: Scales from 0 to 1000+ concurrent requests
+- **Simplified Operations**: No server management or capacity planning
+- **Fast Deployment**: Deploy and update functions in minutes
+
+![Lambda Architecture](../generated-diagrams/bharatvani_lambda_architecture.png)
+
+### Serverless Processing Pipeline
 
 1. **Voice Collection**: Amazon Connect handles IVR interactions and audio recording
-2. **Audio Processing**: Lambda functions process and validate audio quality using librosa
-3. **Feature Extraction**: Extract MFCC and spectral features for ML analysis
-4. **Health Assessment**: SageMaker endpoint performs respiratory health classification
-5. **Results Delivery**: SMS notifications sent via Amazon SNS with health recommendations
-6. **Data Management**: User records stored in DynamoDB, audio files in S3 with lifecycle policies
+2. **Audio Processing**: Lambda function processes and validates audio quality using librosa
+3. **Feature Extraction**: Extract MFCC and spectral features optimized for lightweight ML models
+4. **Health Assessment**: Lambda-based ML inference performs respiratory health classification
+5. **Results Processing**: Lambda function generates recommendations and prepares SMS content
+6. **Results Delivery**: SMS notifications sent via Amazon SNS with health recommendations
+7. **Data Management**: User records stored in DynamoDB, audio files in S3 with lifecycle policies
+
+![User Journey](../generated-diagrams/bharatvani_lambda_user_journey.png)
 
 ## Components and Interfaces
 
@@ -144,24 +106,24 @@ def process_audio(audio_file_path):
 
 ### Machine Learning Engine
 
-**Purpose**: Performs respiratory health risk assessment using voice biomarkers
+**Purpose**: Performs respiratory health risk assessment using voice biomarkers via serverless Lambda functions
 
 **Model Architecture**:
-- Pre-trained classification model for cough analysis
+- Lightweight classification model optimized for Lambda deployment
 - Binary classification: High Risk / Low Risk
 - Confidence scoring for result reliability
+- Model size: <50MB for optimal Lambda performance
 
-**SageMaker Endpoint Configuration**:
+**Lambda Configuration**:
 ```json
 {
-    "EndpointName": "bharatvani-respiratory-classifier",
-    "ModelName": "respiratory-health-model",
-    "InstanceType": "ml.t2.medium",
-    "InitialInstanceCount": 1,
-    "AutoScaling": {
-        "MinCapacity": 1,
-        "MaxCapacity": 10,
-        "TargetValue": 70.0
+    "FunctionName": "bharatvani-respiratory-classifier",
+    "Runtime": "python3.9",
+    "MemorySize": 1024,
+    "Timeout": 30,
+    "Environment": {
+        "MODEL_BUCKET": "bharatvani-models",
+        "MODEL_KEY": "respiratory_model.pkl"
     }
 }
 ```
@@ -177,6 +139,7 @@ Output: Risk assessment
 - risk_level: "HIGH" | "LOW"
 - confidence_score: 0.0 to 1.0
 - recommendations: Array of strings
+- processing_time: Execution duration
 ```
 
 ### Results Delivery System
@@ -528,7 +491,7 @@ The current architecture supports easy addition of new languages through:
 
 The ML pipeline is designed for extensibility:
 - Modular feature extraction supporting different biomarkers
-- Multi-model SageMaker endpoints for different conditions
+- Multi-Lambda deployment for different health conditions
 - Configurable risk assessment workflows
 
 ### Healthcare System Integration
