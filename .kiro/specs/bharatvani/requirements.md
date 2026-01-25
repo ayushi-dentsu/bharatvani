@@ -156,15 +156,19 @@ BharatVani is an AI-powered voice health screening system designed for rural Ind
 5. WHEN scaling operations, THE Voice_Screening_System SHALL support horizontal scaling of all critical components
 6. THE Voice_Screening_System SHALL provide REST APIs for future integration with mobile apps and web interfaces
 
-### Requirement 11: Cost Monitoring Foundation
+### Requirement 11: National Health Stack Integration
 
-**User Story:** As a program manager, I want to establish cost-monitoring foundations during the hackathon, so that future optimization can achieve sustainable per-screening costs in production.
+**User Story:** As a government health official, I want BharatVani to integrate seamlessly with India's National Digital Health Mission, so that voice screening data contributes to comprehensive digital health records and supports national health policy decisions.
 
 #### Acceptance Criteria
 
-1. WHEN processing screenings, THE Voice_Screening_System SHALL implement basic cost monitoring to track AWS resource usage per screening
-2. WHEN storing data, THE Voice_Screening_System SHALL use appropriate storage classes for the hackathon demonstration
-3. WHEN running ML inference, THE ML_Engine SHALL use Lambda functions with appropriate memory allocation and auto-scaling
-4. THE Voice_Screening_System SHALL implement efficient audio compression without compromising analysis quality
-5. THE Voice_Screening_System SHALL provide cost monitoring dashboard to track spending during development
-6. WHERE production deployment occurs, THE Voice_Screening_System SHALL support optimization strategies to achieve sustainable per-screening costs through scale and efficiency improvements
+1. WHEN a user completes screening, THE Voice_Screening_System SHALL automatically create or update their ABHA (Ayushman Bharat Health Account) Health ID 
+2. WHEN storing health records, THE Voice_Screening_System SHALL use ABDM-compatible data formats and schemas following National Digital Health Blueprint standards
+3. WHEN creating health records, THE Voice_Screening_System SHALL build longitudinal health profiles that track screening history over time for continuity of care
+4. THE Voice_Screening_System SHALL provide APIs that are interoperable with all government health systems including HMIS, NIKSHAY, and state health portals
+5. WHEN integrating with ABDM, THE Voice_Screening_System SHALL comply with National Digital Health Blueprint standards and data governance policies
+6. THE Voice_Screening_System SHALL enable healthcare providers to access voice screening data through the Health Information Exchange (HIE) network with appropriate authorization
+7. WHEN users consent, THE Voice_Screening_System SHALL share anonymized population health data with National Health Authority for epidemiological analysis and policy planning
+8. THE Voice_Screening_System SHALL support FHIR R4 standards for health data exchange and maintain compatibility with UHI (Unified Health Interface) protocols (Future Scope)
+9. WHEN users access the system, THE Voice_Screening_System SHALL provide options to link existing ABHA IDs or create new ones through OTP-based verification
+

@@ -16,6 +16,13 @@ The MVP focuses on demonstrating core functionality: voice collection via Amazon
 4. **Cost Optimization**: Pay-per-use serverless services with no minimum charges
 5. **Clinical Validation Ready**: Data collection and analysis pipeline designed for future clinical studies
 
+## Process Flow
+![Process Flow](../../../generated-diagrams/bharatvani_process_flow.png)
+
+## Rural User Journey
+![Rural User Journey](../../../generated-diagrams/bharatvani_rural_user_journey.png)
+
+
 ## Architecture
 
 ### High-Level System Architecture
@@ -28,7 +35,13 @@ The BharatVani system utilizes a serverless architecture built on AWS Lambda fun
 - **Simplified Operations**: No server management or capacity planning
 - **Fast Deployment**: Deploy and update functions in minutes
 
-![Lambda Architecture](../generated-diagrams/bharatvani_lambda_architecture.png)
+## System Architecture 
+
+![System Architecture](../../../generated-diagrams/bharatvani_system_architecture.png)
+
+## Lambda Architecture
+
+![Lambda Architecture](../../../generated-diagrams/bharatvani_lambda_architecture.png)
 
 ### Serverless Processing Pipeline
 
@@ -40,7 +53,7 @@ The BharatVani system utilizes a serverless architecture built on AWS Lambda fun
 6. **Results Delivery**: SMS notifications sent via Amazon SNS with health recommendations
 7. **Data Management**: User records stored in DynamoDB, audio files in S3 with lifecycle policies
 
-![User Journey](../generated-diagrams/bharatvani_lambda_user_journey.png)
+![User Journey](../../../generated-diagrams/bharatvani_lambda_user_journey.png)
 
 ## Components and Interfaces
 
@@ -500,6 +513,33 @@ Prepared for integration with Indian healthcare infrastructure:
 - ABDM-compatible data schemas and APIs
 - FHIR-compliant health record formats
 - Integration points for PHC and ASHA worker systems
+- ABHA Health ID creation and management
+
+### National Digital Health Mission (ABDM) Integration
+
+**ABHA Health ID Management:**
+```json
+{
+    "abha_id": "string (14-digit)",
+    "abha_number": "string (UUID format)",
+    "mobile_number": "string (verified)",
+    "created_via": "bharatvani_voice_screening",
+    "consent_status": "active",
+    "linked_records": ["voice_screening", "cowin", "esanjeevani"]
+}
+```
+
+**Health Information Exchange (HIE) Integration:**
+- Real-time data sync with government health systems
+- FHIR R4 compliant health records
+- UHI (Unified Health Interface) protocol support
+- Secure API endpoints for healthcare provider access
+
+**Population Health Analytics:**
+- Anonymized data sharing with National Health Authority
+- Epidemiological trend analysis
+- Policy planning support through aggregated insights
+- Rural health outcome tracking
 
 ### Scale and Performance Optimization
 
