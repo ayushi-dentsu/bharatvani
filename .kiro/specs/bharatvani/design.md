@@ -17,11 +17,25 @@ The MVP focuses on demonstrating core functionality: voice collection via Amazon
 5. **Clinical Validation Ready**: Data collection and analysis pipeline designed for future clinical studies
 
 ## Process Flow
-![Process Flow](../../../generated-diagrams/bharatvani_process_flow.png)
 
-## Rural User Journey
-![Rural User Journey](../../../generated-diagrams/bharatvani_rural_user_journey.png)
-
+```mermaid
+flowchart TD
+    A[Rural User Calls BharatVani] --> B[Amazon Connect IVR]
+    B --> C[Language Selection<br/>English/Hindi]
+    C --> D[User Information Collection<br/>Name, Age, Phone]
+    D --> E[Health Screening Instructions]
+    E --> F[Guided Audio Collection<br/>3 Coughs, 2-second pauses]
+    F --> G[Audio Recording<br/>30-60 seconds, 16kHz]
+    G --> H[Lambda Audio Processing<br/>Feature Extraction]
+    H --> I[ML Risk Assessment<br/>High/Low Risk + Confidence]
+    I --> J[Results Processing<br/>Recommendations Generation]
+    J --> K[SMS Delivery<br/>Risk Level + Next Steps]
+    K --> L[Real-time Dashboard Update]
+    
+    style A fill:#e1f5fe
+    style K fill:#c8e6c9
+    style I fill:#fff3e0
+```
 
 ## Architecture
 
@@ -37,11 +51,52 @@ The BharatVani system utilizes a serverless architecture built on AWS Lambda fun
 
 ## System Architecture 
 
-![System Architecture](../../../generated-diagrams/bharatvani_system_architecture.png)
+```mermaid
+graph TB
+    subgraph "User Interface Layer"
+        A[📱 Phone Call<br/>Any Phone - Smart/Feature]
+        B[📊 Demo Dashboard<br/>Real-time Visualization]
+    end
+    
+    subgraph "AWS Cloud Services"
+        C[🎙️ Amazon Connect<br/>IVR & Voice Collection]
+        D[⚡ Lambda Functions<br/>Serverless Processing]
+        E[🗄️ S3 Bucket<br/>Encrypted Audio Storage]
+        F[📊 DynamoDB<br/>Health Records & Analytics]
+        G[📱 SNS<br/>SMS Notifications]
+        H[📈 CloudWatch<br/>Monitoring & Logging]
+    end
+    
+    subgraph "Lambda Processing Pipeline"
+        D1[🎵 Audio Processing<br/>librosa + Feature Extraction]
+        D2[🧠 ML Inference<br/>Respiratory Risk Assessment]
+        D3[📝 Results Processing<br/>Recommendations Generation]
+    end
+    
+    subgraph "External Integrations"
+        I[🏥 ABDM/ABHA<br/>Health ID Integration]
+    end
+    
+    A --> C
+    C --> D
+    D --> D1
+    D1 --> D2
+    D2 --> D3
+    D3 --> E
+    D3 --> F
+    D3 --> G
+    D --> H
+    B --> F
+    B --> H
+    F --> I
+    
+    style A fill:#e3f2fd
+    style D fill:#fff3e0
+    style G fill:#e8f5e8
+    style I fill:#fce4ec
+```
 
-## Lambda Architecture
 
-![Lambda Architecture](../../../generated-diagrams/bharatvani_lambda_architecture.png)
 
 ### Serverless Processing Pipeline
 
@@ -53,7 +108,39 @@ The BharatVani system utilizes a serverless architecture built on AWS Lambda fun
 6. **Results Delivery**: SMS notifications sent via Amazon SNS with health recommendations
 7. **Data Management**: User records stored in DynamoDB, audio files in S3 with lifecycle policies
 
-![User Journey](../../../generated-diagrams/bharatvani_lambda_user_journey.png)
+```mermaid
+sequenceDiagram
+    participant U as 👤 Rural User
+    participant C as 🎙️ Amazon Connect
+    participant L1 as ⚡ Audio Processor
+    participant L2 as 🧠 ML Classifier
+    participant L3 as 📱 SMS Handler
+    participant S as 🗄️ Storage (S3/DynamoDB)
+    participant N as 📱 SNS
+    
+    U->>C: 1. Dial BharatVani number
+    C->>U: 2. IVR prompts (language, info)
+    U->>C: 3. Provide name, age, phone
+    C->>U: 4. "Please cough 3 times"
+    U->>C: 5. Cough audio (30-60s)
+    C->>L1: 6. Trigger with audio file
+    
+    L1->>S: 7. Store encrypted audio
+    L1->>L1: 8. Extract MFCC features
+    L1->>L2: 9. Send feature vector
+    
+    L2->>L2: 10. ML inference (<30s)
+    L2->>S: 11. Store results
+    L2->>L3: 12. Trigger SMS with results
+    
+    L3->>L3: 13. Generate SMS content
+    L3->>N: 14. Send SMS request
+    N->>U: 15. SMS with risk assessment
+    
+    Note over U,N: Total time: <5 minutes
+    Note over L1,L2: Serverless auto-scaling
+    Note over S: 30-day data retention
+```
 
 ## Components and Interfaces
 
@@ -525,7 +612,7 @@ Prepared for integration with Indian healthcare infrastructure:
     "mobile_number": "string (verified)",
     "created_via": "bharatvani_voice_screening",
     "consent_status": "active",
-    "linked_records": ["voice_screening", "cowin", "esanjeevani"]
+    "linked_records": ["voice_screening"]
 }
 ```
 
