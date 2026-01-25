@@ -24,24 +24,32 @@ BharatVani is an AI-powered voice health screening system designed to democratiz
 - **Accessibility**: Works on any phone, no internet required
 - **Languages**: Starting with English + Hindi, expanding to 15+ languages
 
-## 🏗️ Architecture Overview
+## 🛠️ Technical Innovation
 
+### Serverless ML Architecture
 ```
-📱 User Phone Call → 🎙️ Amazon Connect IVR → 🧠 AI Analysis → 📱 SMS Results
+📱 User Phone Call → 🎙️ Amazon Connect IVR → ⚡ Lambda ML → 📱 SMS Results
                                     ↓
-                            ☁️ AWS Cloud Services
-                    (Lambda, SageMaker, S3, DynamoDB)
+                            ☁️ AWS Serverless Services
+                    (Lambda, S3, DynamoDB, SNS)
                                     ↓
                             📊 Real-time Dashboard
 ```
 
+**Lambda-First Benefits:**
+- **95% Cost Reduction**: Pay only for actual processing time
+- **Auto-scaling**: 0 to 1000+ concurrent requests automatically
+- **No Server Management**: Focus on code, not infrastructure
+- **Instant Deployment**: Deploy updates in seconds
+
+
 ### Core AWS Services
 - **Amazon Connect**: IVR and voice collection
-- **SageMaker**: ML model inference for health assessment
-- **Lambda**: Audio processing and feature extraction
-- **S3**: Encrypted audio storage
+- **Lambda**: Serverless ML model inference and audio processing
+- **S3**: Encrypted audio storage with lifecycle policies
 - **DynamoDB**: User records and analytics
 - **SNS**: SMS notification delivery
+- **CloudWatch**: Monitoring and logging
 
 ## 🎯 Problem Statement
 
@@ -72,10 +80,10 @@ Voice biomarker analysis through phone calls to screen for:
 ```
 
 ### Machine Learning Models
-- **Respiratory Health**: CNN-based spectrogram classification
+- **Respiratory Health**: Lightweight classification optimized for Lambda
 - **Risk Assessment**: Binary classification (High/Low risk)
 - **Confidence Scoring**: 60% threshold for reliable predictions
-- **Multi-language Support**: Transfer learning for Indian languages
+- **Model Size**: <50MB for optimal serverless performance
 
 ## 📋 Project Structure
 
@@ -129,7 +137,7 @@ npm run dev
 ### Phase 1: Hackathon MVP (48 hours) ✅
 - [x] Requirements and design documentation
 - [ ] Basic IVR system with Amazon Connect
-- [ ] Cough risk assessment ML model
+- [ ] Lambda-based cough risk assessment model
 - [ ] SMS notification system
 - [ ] Real-time demo dashboard
 
@@ -139,11 +147,17 @@ npm run dev
 - [ ] PHC integration in rural Karnataka
 - [ ] ASHA worker mobile interface
 
-### Phase 3: Scale (6-12 months)
+### Phase 3: Scale & National Health Stack Integration (6-12 months)
 - [ ] 15+ Indian languages
-- [ ] ABDM integration
-- [ ] Advanced ML models
-- [ ] Government partnerships
+- [ ] **ABDM Integration**: Seamless integration with India's National Digital Health Mission
+  - [ ] ABHA Health ID auto-creation and linking
+  - [ ] CoWIN vaccination record synchronization
+  - [ ] eSanjeevani consultation history integration
+  - [ ] Longitudinal health profiles with screening history
+  - [ ] FHIR R4 compliant health records
+  - [ ] Health Information Exchange (HIE) network connectivity
+- [ ] Advanced ML models for multi-condition screening
+- [ ] Government partnerships and policy integration
 
 ### Phase 4: National Impact (1-3 years)
 - [ ] 50 million screenings
@@ -173,9 +187,9 @@ npm run dev
 - **Pharma**: Early risk identification for medication adherence
 
 ### Unit Economics
-- **Cost per screening**: ₹2
-- **Price per screening**: ₹10
-- **Break-even**: 50,000 screenings/month
+- **Cost per screening**: ₹10 (Lambda-optimized)
+- **Price per screening**: ₹15
+- **Break-even**: 3,000 screenings/month
 - **Year 2 projection**: 10 million screenings
 
 ## 🏆 Why BharatVani Will Win
@@ -192,7 +206,7 @@ npm run dev
 ## 🤝 Team & Contributions
 
 ### Required Expertise
-- **ML Engineer**: Voice/audio processing, SageMaker
+- **ML Engineer**: Voice/audio processing, Lambda deployment
 - **Backend Developer**: AWS services integration
 - **Healthcare Expert**: Clinical validation
 - **Full-Stack Developer**: Dashboard and APIs
