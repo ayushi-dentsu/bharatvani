@@ -1,0 +1,12 @@
+# datasets
+data/
+datasets/
+*.wav
+*.zip
+*.tar
+*.gz
+
+# ML artifacts
+models/
+checkpoints/
+data/coughvid/
