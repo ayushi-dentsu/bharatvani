@@ -1,3 +1,9 @@
+terraform/credentials.json
+
+# ML deployment artifacts
+ml/cough-predictor/
+ml/function.zip
+ml/function.zip.zip
 # datasets
 data/
 datasets/
