@@ -1,0 +1,23 @@
+{
+  "name": "bharatvani-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "@aws-sdk/client-s3": "^3.490.0",
+    "@aws-sdk/client-lambda": "^3.490.0",
+    "@aws-sdk/client-dynamodb": "^3.490.0",
+    "@aws-sdk/lib-dynamodb": "^3.490.0",
+    "@aws-sdk/s3-request-presigner": "^3.490.0",
+    "recharts": "^2.10.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "deploy": "aws s3 sync build/ s3://bharatvani-dashboard --delete"
+  },
+  "devDependencies": {
+    "react-scripts": "5.0.1"
+  }
+}
