@@ -31,7 +31,7 @@ BharatVani is an AI-powered voice health screening system designed to democratiz
 📱 User Phone Call → 🎙️ Amazon Connect IVR → ⚡ Lambda ML → 📱 SMS Results
                                     ↓
                             ☁️ AWS Serverless Services
-                    (Lambda, S3, DynamoDB, SNS)
+                            (Lambda, S3, DynamoDB, SNS)
                                     ↓
                             📊 Real-time Dashboard
 ```

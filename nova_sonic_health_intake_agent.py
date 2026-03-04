@@ -3,7 +3,7 @@
 Nova 2 Sonic Health Intake Agent (single-script terminal app)
 
 Requirements (pip):
-  pip install pyaudio boto3 aws-sdk-bedrock-runtime smithy-aws-core
+pip install pyaudio boto3 aws-sdk-bedrock-runtime smithy-aws-core
 """
 
 import argparse
@@ -16,11 +16,16 @@ import struct
 import time
 import uuid
 import wave
+import boto3
+
+import os
+from monocle_apptrace import setup_monocle_telemetry
+setup_monocle_telemetry(workflow_name="bharat-vaani-health-app")
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import boto3
 import pyaudio
 from aws_sdk_bedrock_runtime.client import (
     BedrockRuntimeClient,

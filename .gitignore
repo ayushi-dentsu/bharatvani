@@ -1,5 +1,8 @@
 terraform/credentials.json
 
+# Virtual environment
+venv/
+
 # ML deployment artifacts
 ml/cough-predictor/
 ml/function.zip
