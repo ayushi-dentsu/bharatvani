@@ -25,8 +25,8 @@ import sys
 import time
 import uuid
 import wave
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Optional
 
@@ -173,8 +173,11 @@ def parse_binary(text: str) -> Optional[int]:
 
 
 def parse_age(text: str) -> Optional[int]:
-    """Extract first integer from text as age."""
-    digits = "".join(ch if ch.isdigit() else " " for ch in text)
+    """Extract first integer from text as age. Handles Hindi numerals too."""
+    # Map Hindi/Devanagari digits to ASCII
+    hindi_digit_map = str.maketrans("०१२३४५६७८९", "0123456789")
+    t = text.translate(hindi_digit_map)
+    digits = "".join(ch if ch.isdigit() else " " for ch in t)
     for tok in digits.split():
         try:
             v = int(tok)
@@ -182,6 +185,24 @@ def parse_age(text: str) -> Optional[int]:
                 return v
         except ValueError:
             pass
+    # Try common Hindi number words
+    hindi_numbers = {
+        "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पांच": 5, "पाँच": 5,
+        "छह": 6, "छः": 6, "सात": 7, "आठ": 8, "नौ": 9, "दस": 10,
+        "ग्यारह": 11, "बारह": 12, "तेरह": 13, "चौदह": 14, "पंद्रह": 15,
+        "सोलह": 16, "सत्रह": 17, "अठारह": 18, "उन्नीस": 19, "बीस": 20,
+        "इक्कीस": 21, "बाईस": 22, "तेईस": 23, "चौबीस": 24, "पच्चीस": 25,
+        "छब्बीस": 26, "सत्ताईस": 27, "अट्ठाईस": 28, "उनतीस": 29, "तीस": 30,
+        "इकतीस": 31, "बत्तीस": 32, "तैंतीस": 33, "तेंतीस": 33, "तेसतीस": 33,
+        "चौंतीस": 34, "पैंतीस": 35, "छत्तीस": 36, "सैंतीस": 37, "अड़तीस": 38,
+        "उनतालीस": 39, "चालीस": 40, "पैंतालीस": 45, "पचास": 50,
+        "पचपन": 55, "साठ": 60, "पैंसठ": 65, "सत्तर": 70, "पचहत्तर": 75,
+        "अस्सी": 80, "पचासी": 85, "नब्बे": 90, "पंचानवे": 95, "सौ": 100,
+    }
+    t_lower = text.strip().lower()
+    for word, val in hindi_numbers.items():
+        if word in t_lower:
+            return val
     return None
 
 
@@ -296,13 +317,6 @@ class NovaSonicClient:
         if "audioInput" not in event_keys and event_keys:
             log_event(f"SENT → {event_keys}")
 
-    async def _send_json(self, raw_json: str) -> None:
-        """Send a pre-serialized JSON string."""
-        chunk = InvokeModelWithBidirectionalStreamInputChunk(
-            value=BidirectionalInputPayloadPart(bytes_=raw_json.encode("utf-8"))
-        )
-        async with self._send_lock:
-            await self.stream.input_stream.send(chunk)
 
     # ── Session lifecycle ────────────────────────────────────────────────────
     async def open_session(self, system_prompt: str) -> None:
@@ -569,8 +583,6 @@ class NovaSonicClient:
                                 self._last_assistant_text = text.strip()
                                 self.assistant_text_parts.append(text.strip())
                                 print(f"  🤖 {text.strip()}")
-                            else:
-                                print(f"  🤖 [dedup-skipped] {text.strip()}")
                         elif role == "USER" and text.strip():
                             self.user_text_parts.append(text.strip())
                             print(f"  🎤 {text.strip()}")
@@ -731,14 +743,6 @@ class NovaSonicClient:
         except asyncio.CancelledError:
             pass
 
-    # ── High-level helpers for the state machine ─────────────────────────────
-    def get_latest_user_text(self) -> str:
-        """Return the most recent user transcript text and clear the buffer."""
-        if self.user_text_parts:
-            text = self.user_text_parts[-1]
-            self.user_text_parts.clear()
-            return text
-        return ""
 
     def get_all_assistant_text(self) -> str:
         """Return all assistant text since last clear."""
@@ -949,13 +953,14 @@ class HealthIntakeAgent:
     # System prompt keeps the model tightly constrained
     SYSTEM_PROMPT = (
         "You are a multilingual health intake voice assistant. "
-        "You MUST speak ONLY in the language the app tells you. "
-        "You MUST say ONLY the exact sentence the app provides. "
-        "Do NOT add extra sentences, greetings, or commentary. "
-        "Do NOT diagnose or give medical advice. "
-        "If told to speak Hindi, use natural Devanagari Hindi, not Hinglish. "
-        "If told to speak English, use only English. "
-        "Keep every response to one short sentence."
+        "STRICT RULES: "
+        "1. Speak ONLY the exact sentence the app tells you. Do NOT add anything else. "
+        "2. Do NOT say 'unintelligible', do NOT ask the user to repeat, do NOT add commentary. "
+        "3. Do NOT refuse instructions. If told to say something, say it. "
+        "4. If told to speak Hindi, use natural Devanagari Hindi. "
+        "5. If told to speak English, use only English. "
+        "6. Never diagnose, never give medical advice. "
+        "7. When asked to reply with only a number or word, do exactly that."
     )
 
     MAX_RETRIES = 2  # retries per question on timeout/no-input
@@ -1121,8 +1126,10 @@ class HealthIntakeAgent:
             f"The user was asked a yes/no health question and answered: \"{text}\". "
             "Reply with ONLY the word 'yes' or 'no'. Nothing else."
         )
+        self.nova._mute_mic = True
         await self.nova.send_text(instruction)
-        await asyncio.sleep(3.0)
+        await self._wait_until_assistant_done(timeout_s=5.0)
+        self.nova._mute_mic = False
         response = self.nova.get_all_assistant_text().strip().lower()
         if "yes" in response:
             return 1
@@ -1133,11 +1140,13 @@ class HealthIntakeAgent:
     async def _model_interpret_age(self, text: str) -> Optional[int]:
         """Ask the model to extract age from ambiguous text."""
         instruction = (
-            f"The user was asked their age and answered: \"{text}\". "
-            "Reply with ONLY the number. Nothing else."
+            f"The user said: \"{text}\". Extract the age as a number. "
+            "Respond with ONLY the number, nothing else. No words, no explanation."
         )
+        self.nova._mute_mic = True
         await self.nova.send_text(instruction)
-        await asyncio.sleep(3.0)
+        await self._wait_until_assistant_done(timeout_s=5.0)
+        self.nova._mute_mic = False
         response = self.nova.get_all_assistant_text().strip()
         return parse_age(response)
 
@@ -1369,6 +1378,13 @@ async def async_main() -> None:
 
 
 if __name__ == "__main__":
+    # Suppress noisy CRT InvalidStateError on teardown
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    import logging
+    logging.getLogger("awscrt").setLevel(logging.CRITICAL)
+
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
