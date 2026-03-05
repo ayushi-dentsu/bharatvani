@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Nova 2 Sonic Health Intake Agent (single-script terminal app)
+Nova 2 Sonic – Multilingual Health Intake Voice Agent
+=====================================================
+Single-file terminal app using AWS Bedrock Nova 2 Sonic bidirectional streaming.
+Deterministic state-machine controls the conversation (no free-form dialogue).
 
-Requirements (pip):
-pip install pyaudio boto3 aws-sdk-bedrock-runtime smithy-aws-core
+Dependencies:
+    pip install pyaudio boto3 aws-sdk-bedrock-runtime smithy-aws-core
+
+Run:
+    python nova_sonic_health_intake_agent.py --s3-bucket my-bucket
+    python nova_sonic_health_intake_agent.py --s3-bucket my-bucket --voice-id arjun --debug-events
+    python nova_sonic_health_intake_agent.py --list-audio-devices
 """
 
 import argparse
@@ -13,1070 +21,1221 @@ import json
 import math
 import os
 import struct
+import sys
 import time
 import uuid
 import wave
-import boto3
-
-import os
-from monocle_apptrace import setup_monocle_telemetry
-setup_monocle_telemetry(workflow_name="bharat-vaani-health-app")
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum, auto
 from typing import Any, Optional
 
+import boto3
 import pyaudio
 from aws_sdk_bedrock_runtime.client import (
     BedrockRuntimeClient,
     InvokeModelWithBidirectionalStreamOperationInput,
 )
-from aws_sdk_bedrock_runtime.config import Config
+from aws_sdk_bedrock_runtime.config import Config, HTTPAuthSchemeResolver, SigV4AuthScheme
 from aws_sdk_bedrock_runtime.models import (
     BidirectionalInputPayloadPart,
     InvokeModelWithBidirectionalStreamInputChunk,
 )
-from smithy_aws_core.identity import StaticCredentialsResolver
+from smithy_aws_core.credentials_resolvers.environment import EnvironmentCredentialsResolver
 
+# ─── Audio constants ────────────────────────────────────────────────────────────
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK_SIZE = 1024
 
+# ─── Intake field definitions ───────────────────────────────────────────────────
+SYMPTOM_FIELDS = ["fever", "cold", "cough", "fatigue", "loss_of_smell", "breathing_difficulties"]
+HISTORY_FIELDS = ["asthma", "diabetes", "hypertension", "smoker"]
+ALL_BINARY_FIELDS = SYMPTOM_FIELDS + HISTORY_FIELDS
 
-HEALTH_SYSTEM_PROMPT = (
-    "You are a multilingual health intake agent. Ask one question at a time in the "
-    "selected language. Adapt based on answers. Collect structured information. "
-    "The user picks either English or Hindi. If user mixes languages, still respond only "
-    "in selected language. If selected language is Hindi, speak natural Hindi in Devanagari "
-    "script and avoid Hinglish unless user explicitly asks. If selected language is English, "
-    "speak neutral English only. Be calm and professional. If user says 'skip', acknowledge and "
-    "move on. Do not diagnose. Do not provide risk score. Do not give medical advice."
-)
-
-
-def pcm16_rms(data: bytes) -> int:
-    if not data:
-        return 0
-    sample_count = len(data) // 2
-    if sample_count == 0:
-        return 0
-    samples = struct.unpack("<" + ("h" * sample_count), data[: sample_count * 2])
-    mean_sq = sum(s * s for s in samples) / sample_count
-    return int(math.sqrt(mean_sq))
+# ─── State machine ──────────────────────────────────────────────────────────────
+class State(Enum):
+    LANGUAGE_SELECT = auto()
+    ASKING = auto()
+    WAITING_USER = auto()
+    COUGH_PHASE = auto()
+    DONE = auto()
 
 
+# ─── Logging ─────────────────────────────────────────────────────────────────────
+DEBUG_EVENTS = False
+DEBUG_AUDIO = False
+
+def ts() -> str:
+    """Timestamped prefix for log lines."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+def log_event(msg: str) -> None:
+    if DEBUG_EVENTS:
+        print(f"[{ts()}] [EVENT] {msg}")
+
+def log_audio(msg: str) -> None:
+    if DEBUG_AUDIO:
+        print(f"[{ts()}] [AUDIO] {msg}")
+
+def log_info(msg: str) -> None:
+    print(f"[{ts()}] {msg}")
+
+
+# ─── Utility ─────────────────────────────────────────────────────────────────────
+def pcm16_rms(data: bytes) -> float:
+    """Compute RMS of 16-bit PCM data."""
+    n = len(data) // 2
+    if n == 0:
+        return 0.0
+    samples = struct.unpack(f"<{n}h", data[:n * 2])
+    return math.sqrt(sum(s * s for s in samples) / n)
+
+
+# ─── Questions definition ────────────────────────────────────────────────────────
 @dataclass
-class PromptResult:
-    prompt_name: str
-    assistant_text: str
-    user_text: str
+class IntakeQuestion:
+    key: str                    # field name in output
+    english: str                # question text in English
+    hindi: str                  # question text in Hindi
+    field_type: str = "text"    # "text", "binary", "age", "gender"
+
+INTAKE_QUESTIONS: list[IntakeQuestion] = [
+    IntakeQuestion("name",   "What is your full name?", "आपका पूरा नाम क्या है?", "text"),
+    IntakeQuestion("age",    "How old are you?", "आपकी उम्र क्या है?", "age"),
+    IntakeQuestion("gender", "What is your gender? Male, Female, or Other?",
+                   "आपका लिंग क्या है? पुरुष, महिला, या अन्य?", "gender"),
+    # Symptoms
+    IntakeQuestion("fever",   "Do you have fever? Yes or No.", "क्या आपको बुखार है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("cold",    "Do you have cold? Yes or No.", "क्या आपको सर्दी है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("cough",   "Do you have cough? Yes or No.", "क्या आपको खांसी है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("fatigue", "Do you have fatigue? Yes or No.", "क्या आपको थकान है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("loss_of_smell", "Have you lost your sense of smell? Yes or No.",
+                   "क्या आपकी सूंघने की शक्ति कम हुई है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("breathing_difficulties", "Do you have breathing difficulties? Yes or No.",
+                   "क्या आपको सांस लेने में कठिनाई है? हाँ या नहीं।", "binary"),
+    # History
+    IntakeQuestion("asthma",       "Do you have asthma? Yes or No.", "क्या आपको अस्थमा है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("diabetes",     "Do you have diabetes? Yes or No.", "क्या आपको मधुमेह है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("hypertension", "Do you have hypertension? Yes or No.",
+                   "क्या आपको उच्च रक्तचाप है? हाँ या नहीं।", "binary"),
+    IntakeQuestion("smoker",       "Are you a smoker? Yes or No.", "क्या आप धूम्रपान करते हैं? हाँ या नहीं।", "binary"),
+]
 
 
-class NovaSonicBidiClient:
+# ─── Answer parsing helpers ──────────────────────────────────────────────────────
+YES_WORDS = {
+    "yes", "yeah", "yep", "yup", "sure", "correct", "right", "affirmative",
+    "हाँ", "हां", "जी", "जी हाँ", "ha", "haan", "ji",
+}
+NO_WORDS = {
+    "no", "nope", "nah", "negative", "not",
+    "नहीं", "ना", "नही", "nahi", "nahin",
+}
+SKIP_WORDS = {
+    "skip", "please skip", "next", "pass",
+    "स्किप", "छोड़ो", "छोड़िए", "अगला",
+}
+GENDER_MAP = {
+    "male": "M", "man": "M", "boy": "M", "m": "M",
+    "पुरुष": "M", "आदमी": "M", "लड़का": "M",
+    "female": "F", "woman": "F", "girl": "F", "f": "F",
+    "महिला": "F", "औरत": "F", "लड़की": "F",
+    "other": "O", "others": "O", "non-binary": "O", "nonbinary": "O",
+    "अन्य": "O",
+}
+
+
+def is_skip(text: str) -> bool:
+    return text.strip().lower() in SKIP_WORDS
+
+
+def parse_binary(text: str) -> Optional[int]:
+    """Return 1 for yes, 0 for no, None if unclear."""
+    t = text.strip().lower()
+    tokens = set(t.split())
+    if tokens & YES_WORDS or t in YES_WORDS:
+        return 1
+    if tokens & NO_WORDS or t in NO_WORDS:
+        return 0
+    # Fallback: check if any yes/no word is a substring
+    for w in YES_WORDS:
+        if w in t:
+            return 1
+    for w in NO_WORDS:
+        if w in t:
+            return 0
+    return None
+
+
+def parse_age(text: str) -> Optional[int]:
+    """Extract first integer from text as age."""
+    digits = "".join(ch if ch.isdigit() else " " for ch in text)
+    for tok in digits.split():
+        try:
+            v = int(tok)
+            if 0 < v < 150:
+                return v
+        except ValueError:
+            pass
+    return None
+
+
+def parse_gender(text: str) -> str:
+    """Map text to M/F/O, default U."""
+    t = text.strip().lower()
+    for key, val in GENDER_MAP.items():
+        if key in t:
+            return val
+    return "U"
+
+
+def detect_language_choice(text: str) -> Optional[str]:
+    """Detect English or Hindi from user utterance."""
+    t = text.strip().lower()
+    eng_markers = ["english", "inglish", "अंग्रेज", "एंग्लिश", "angrez"]
+    hindi_markers = ["hindi", "हिंदी", "हिन्दी"]
+    for m in eng_markers:
+        if m in t:
+            return "English"
+    for m in hindi_markers:
+        if m in t:
+            return "Hindi"
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Nova Sonic Bidirectional Streaming Client
+# ═══════════════════════════════════════════════════════════════════════════════
+class NovaSonicClient:
+    """
+    Manages a single bidirectional streaming session with Bedrock Nova 2 Sonic.
+    Follows the reference sample's event-loop architecture:
+        sessionStart → promptStart → contentStart → audioInput/textInput →
+        contentEnd → promptEnd → sessionEnd
+    """
+
     def __init__(
         self,
         model_id: str,
         region: str,
         voice_id: str,
-        debug_events: bool = False,
-        debug_audio: bool = False,
         input_device_index: Optional[int] = None,
         output_device_index: Optional[int] = None,
     ):
         self.model_id = model_id
         self.region = region
         self.voice_id = voice_id
-        self.debug_events = debug_events
-        self.debug_audio = debug_audio
         self.input_device_index = input_device_index
         self.output_device_index = output_device_index
 
-        self.client: Optional[BedrockRuntimeClient] = None
+        self.bedrock_client: Optional[BedrockRuntimeClient] = None
         self.stream = None
         self.is_active = False
 
-        self.response_task: Optional[asyncio.Task] = None
-        self.playback_task: Optional[asyncio.Task] = None
-        self.mic_task: Optional[asyncio.Task] = None
+        # Asyncio primitives
+        self._send_lock = asyncio.Lock()  # serialize all sends to avoid race conditions
+        self.audio_input_queue: asyncio.Queue = asyncio.Queue()
+        self.audio_output_queue: asyncio.Queue = asyncio.Queue()
 
-        self.session_prompt_name: Optional[str] = None
-        self.audio_input_content_name: Optional[str] = None
+        # Tasks
+        self._response_task: Optional[asyncio.Task] = None
+        self._audio_send_task: Optional[asyncio.Task] = None
+        self._playback_task: Optional[asyncio.Task] = None
 
-        self.audio_out_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
-        self.user_text_queue: asyncio.Queue[str] = asyncio.Queue()
-        self.assistant_text_queue: asyncio.Queue[str] = asyncio.Queue()
-        self.capture_enabled = False
+        # Session identifiers
+        self.prompt_name: str = ""
+        self.audio_content_name: str = ""
 
-        self.events: list[dict[str, Any]] = []
-        self.events_cv = asyncio.Condition()
-        self.content_roles: dict[tuple[str, str], str] = {}
-        self._last_user_text = ""
-        self.transcript: list[dict[str, str]] = []
+        # Transcript collection
+        self.user_text_parts: list[str] = []
+        self.assistant_text_parts: list[str] = []
+        self._last_assistant_text: str = ""  # for dedup
+        self.barge_in = False
 
-    def _initialize_client(self) -> None:
-        session = boto3.Session(region_name=self.region)
-        creds = session.get_credentials()
-        if creds is None:
-            raise RuntimeError("No AWS credentials found. Configure credentials or AWS_PROFILE.")
-        frozen = creds.get_frozen_credentials()
+        # PyAudio handles
+        self._pa: Optional[pyaudio.PyAudio] = None
+        self._input_stream = None
+        self._output_stream = None
 
+    # ── Client init ──────────────────────────────────────────────────────────
+    def _init_bedrock(self) -> None:
         config = Config(
             endpoint_uri=f"https://bedrock-runtime.{self.region}.amazonaws.com",
             region=self.region,
-            aws_credentials_identity_resolver=StaticCredentialsResolver(),
-            aws_access_key_id=frozen.access_key,
-            aws_secret_access_key=frozen.secret_key,
-            aws_session_token=frozen.token,
+            aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
+            http_auth_scheme_resolver=HTTPAuthSchemeResolver(),
+            http_auth_schemes={"aws.auth#sigv4": SigV4AuthScheme()},
         )
-        self.client = BedrockRuntimeClient(config=config)
+        self.bedrock_client = BedrockRuntimeClient(config=config)
 
-    async def _send_event(self, payload: dict[str, Any]) -> None:
-        event_json = json.dumps(payload, ensure_ascii=True)
-        event = InvokeModelWithBidirectionalStreamInputChunk(
-            value=BidirectionalInputPayloadPart(bytes_=event_json.encode("utf-8"))
+    # ── Low-level send (lock-protected) ──────────────────────────────────────
+    async def _send_event(self, payload: dict) -> None:
+        raw = json.dumps(payload)
+        chunk = InvokeModelWithBidirectionalStreamInputChunk(
+            value=BidirectionalInputPayloadPart(bytes_=raw.encode("utf-8"))
         )
-        await self.stream.input_stream.send(event)
+        async with self._send_lock:
+            try:
+                await self.stream.input_stream.send(chunk)
+            except Exception as e:
+                log_event(f"Send error: {e}")
+                raise
+        # Log non-audio events
+        event_keys = list(payload.get("event", {}).keys())
+        if "audioInput" not in event_keys and event_keys:
+            log_event(f"SENT → {event_keys}")
 
-    def _audio_output_config(self) -> dict[str, Any]:
-        return {
-            "mediaType": "audio/lpcm",
-            "sampleRateHertz": OUTPUT_SAMPLE_RATE,
-            "sampleSizeBits": 16,
-            "channelCount": 1,
-            "voiceId": self.voice_id,
-            "encoding": "base64",
-            "audioType": "SPEECH",
-        }
+    async def _send_json(self, raw_json: str) -> None:
+        """Send a pre-serialized JSON string."""
+        chunk = InvokeModelWithBidirectionalStreamInputChunk(
+            value=BidirectionalInputPayloadPart(bytes_=raw_json.encode("utf-8"))
+        )
+        async with self._send_lock:
+            await self.stream.input_stream.send(chunk)
 
-    def _audio_input_config(self) -> dict[str, Any]:
-        return {
-            "mediaType": "audio/lpcm",
-            "sampleRateHertz": INPUT_SAMPLE_RATE,
-            "sampleSizeBits": 16,
-            "channelCount": 1,
-            "audioType": "SPEECH",
-            "encoding": "base64",
-        }
+    # ── Session lifecycle ────────────────────────────────────────────────────
+    async def open_session(self, system_prompt: str) -> None:
+        """Open stream, send sessionStart + promptStart + system text, start audio I/O."""
+        if not self.bedrock_client:
+            self._init_bedrock()
 
-    async def _append_event(self, event: dict[str, Any]) -> None:
-        async with self.events_cv:
-            self.events.append(event)
-            self.events_cv.notify_all()
+        self.stream = await self.bedrock_client.invoke_model_with_bidirectional_stream(
+            InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
+        )
+        self.is_active = True
+        self.prompt_name = str(uuid.uuid4())
+        self.audio_content_name = str(uuid.uuid4())
+        self.user_text_parts.clear()
+        self.assistant_text_parts.clear()
+        self._last_assistant_text = ""
+        self.barge_in = False
 
-    def _event_mark(self) -> int:
-        return len(self.events)
+        # 1) sessionStart
+        await self._send_event({
+            "event": {
+                "sessionStart": {
+                    "inferenceConfiguration": {
+                        "maxTokens": 1024,
+                        "topP": 0.9,
+                        "temperature": 0.1,
+                    }
+                }
+            }
+        })
 
-    async def _wait_for(self, predicate, since_mark: int, timeout_s: float) -> list[dict[str, Any]]:
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout_s
-        cursor = since_mark
-        matched: list[dict[str, Any]] = []
+        # 2) promptStart
+        await self._send_event({
+            "event": {
+                "promptStart": {
+                    "promptName": self.prompt_name,
+                    "textOutputConfiguration": {"mediaType": "text/plain"},
+                    "audioOutputConfiguration": {
+                        "mediaType": "audio/lpcm",
+                        "sampleRateHertz": OUTPUT_SAMPLE_RATE,
+                        "sampleSizeBits": 16,
+                        "channelCount": 1,
+                        "voiceId": self.voice_id,
+                        "encoding": "base64",
+                        "audioType": "SPEECH",
+                    },
+                }
+            }
+        })
 
-        while True:
-            async with self.events_cv:
-                new_events = self.events[cursor:]
-                cursor = len(self.events)
-                for ev in new_events:
-                    if predicate(ev):
-                        matched.append(ev)
+        # 3) System prompt as TEXT content
+        sys_content = str(uuid.uuid4())
+        await self._send_event({
+            "event": {
+                "contentStart": {
+                    "promptName": self.prompt_name,
+                    "contentName": sys_content,
+                    "type": "TEXT",
+                    "interactive": False,
+                    "role": "SYSTEM",
+                    "textInputConfiguration": {"mediaType": "text/plain"},
+                }
+            }
+        })
+        await self._send_event({
+            "event": {
+                "textInput": {
+                    "promptName": self.prompt_name,
+                    "contentName": sys_content,
+                    "content": system_prompt,
+                }
+            }
+        })
+        await self._send_event({
+            "event": {
+                "contentEnd": {
+                    "promptName": self.prompt_name,
+                    "contentName": sys_content,
+                }
+            }
+        })
 
-                if loop.time() >= deadline:
-                    return matched
+        # 4) Open audio input content (stays open for mic streaming)
+        await self._send_event({
+            "event": {
+                "contentStart": {
+                    "promptName": self.prompt_name,
+                    "contentName": self.audio_content_name,
+                    "type": "AUDIO",
+                    "interactive": True,
+                    "role": "USER",
+                    "audioInputConfiguration": {
+                        "mediaType": "audio/lpcm",
+                        "sampleRateHertz": INPUT_SAMPLE_RATE,
+                        "sampleSizeBits": 16,
+                        "channelCount": 1,
+                        "audioType": "SPEECH",
+                        "encoding": "base64",
+                    },
+                }
+            }
+        })
 
-                wait_left = deadline - loop.time()
+        # Start background tasks
+        self._response_task = asyncio.create_task(self._response_loop())
+        self._audio_send_task = asyncio.create_task(self._audio_send_loop())
+        self._start_audio_io()
+
+        log_info("Session opened")
+
+    async def close_session(self) -> None:
+        """Cleanly tear down: contentEnd → promptEnd → sessionEnd → close."""
+        if not self.is_active:
+            return
+        self.is_active = False
+
+        # Stop mic input stream first
+        self._stop_audio_input()
+
+        # Close audio content
+        try:
+            await self._send_event({
+                "event": {
+                    "contentEnd": {
+                        "promptName": self.prompt_name,
+                        "contentName": self.audio_content_name,
+                    }
+                }
+            })
+        except Exception:
+            pass
+
+        # promptEnd
+        try:
+            await self._send_event({
+                "event": {"promptEnd": {"promptName": self.prompt_name}}
+            })
+        except Exception:
+            pass
+
+        # sessionEnd
+        try:
+            await self._send_event({"event": {"sessionEnd": {}}})
+        except Exception:
+            pass
+
+        # Close the stream
+        try:
+            await self.stream.input_stream.close()
+        except Exception:
+            pass
+
+        # Signal playback to stop
+        await self.audio_output_queue.put(None)
+
+        # Cancel tasks
+        for task in [self._response_task, self._audio_send_task, self._playback_task]:
+            if task and not task.done():
+                task.cancel()
+        tasks = [t for t in [self._response_task, self._audio_send_task, self._playback_task] if t]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Cleanup PyAudio output
+        self._stop_audio_output()
+
+        log_info("Session closed")
+
+
+    # ── Send text instruction to model ───────────────────────────────────────
+    async def send_text(self, text: str, role: str = "USER") -> None:
+        """Send a text content block (USER or SYSTEM) within the current prompt."""
+        cn = str(uuid.uuid4())
+        await self._send_event({
+            "event": {
+                "contentStart": {
+                    "promptName": self.prompt_name,
+                    "contentName": cn,
+                    "type": "TEXT",
+                    "interactive": True,
+                    "role": role,
+                    "textInputConfiguration": {"mediaType": "text/plain"},
+                }
+            }
+        })
+        await self._send_event({
+            "event": {
+                "textInput": {
+                    "promptName": self.prompt_name,
+                    "contentName": cn,
+                    "content": text,
+                }
+            }
+        })
+        await self._send_event({
+            "event": {
+                "contentEnd": {
+                    "promptName": self.prompt_name,
+                    "contentName": cn,
+                }
+            }
+        })
+        log_event(f"Sent text ({role}): {text[:80]}...")
+
+    # ── Response processing loop ─────────────────────────────────────────────
+    async def _response_loop(self) -> None:
+        """Read events from the Bedrock stream and dispatch."""
+        try:
+            while self.is_active:
                 try:
-                    await asyncio.wait_for(self.events_cv.wait(), timeout=wait_left)
+                    output = await self.stream.await_output()
+                    result = await output[1].receive()
+                    if not result.value or not result.value.bytes_:
+                        continue
+                    data = json.loads(result.value.bytes_.decode("utf-8"))
+                    event = data.get("event", {})
+
+                    if "contentStart" in event:
+                        log_event(f"contentStart role={event['contentStart'].get('role')}")
+
+                    elif "textOutput" in event:
+                        to = event["textOutput"]
+                        text = to.get("content", "")
+                        role = to.get("role", "")
+
+                        # Barge-in detection
+                        if '{ "interrupted" : true }' in text:
+                            self.barge_in = True
+                            log_event("Barge-in detected")
+                            continue
+
+                        if role == "ASSISTANT" and text.strip():
+                            # Deduplicate repeated outputs
+                            if text.strip() != self._last_assistant_text:
+                                self._last_assistant_text = text.strip()
+                                self.assistant_text_parts.append(text.strip())
+                                print(f"  🤖 {text.strip()}")
+                        elif role == "USER" and text.strip():
+                            self.user_text_parts.append(text.strip())
+                            print(f"  🎤 {text.strip()}")
+
+                    elif "audioOutput" in event:
+                        audio_b64 = event["audioOutput"].get("content")
+                        if audio_b64:
+                            audio_bytes = base64.b64decode(audio_b64)
+                            log_audio(f"audioOutput bytes={len(audio_bytes)}")
+                            await self.audio_output_queue.put(audio_bytes)
+
+                    elif "contentEnd" in event:
+                        log_event("contentEnd")
+
+                    elif "error" in event:
+                        log_info(f"Stream error: {event['error']}")
+
+                except StopAsyncIteration:
+                    break
+                except Exception as e:
+                    if "ValidationException" in str(e):
+                        log_info(f"Validation error: {e}")
+                    else:
+                        log_info(f"Response error: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log_info(f"Response loop fatal: {e}")
+        finally:
+            self.is_active = False
+
+    # ── Audio send loop ──────────────────────────────────────────────────────
+    async def _audio_send_loop(self) -> None:
+        """Drain audio_input_queue and send audioInput events to Bedrock."""
+        try:
+            while self.is_active:
+                try:
+                    audio_bytes = await asyncio.wait_for(
+                        self.audio_input_queue.get(), timeout=0.1
+                    )
                 except asyncio.TimeoutError:
-                    return matched
-
-    async def _send_system_content(self, prompt_name: str, system_text: str) -> None:
-        content_name = str(uuid.uuid4())
-        await self._send_event(
-            {
-                "event": {
-                    "contentStart": {
-                        "promptName": prompt_name,
-                        "contentName": content_name,
-                        "type": "TEXT",
-                        "interactive": False,
-                        "role": "SYSTEM",
-                        "textInputConfiguration": {"mediaType": "text/plain"},
-                    }
-                }
-            }
-        )
-        await self._send_event(
-            {
-                "event": {
-                    "textInput": {
-                        "promptName": prompt_name,
-                        "contentName": content_name,
-                        "content": system_text,
-                    }
-                }
-            }
-        )
-        await self._send_event(
-            {
-                "event": {
-                    "contentEnd": {
-                        "promptName": prompt_name,
-                        "contentName": content_name,
-                    }
-                }
-            }
-        )
-
-    async def _send_user_text(self, text: str) -> None:
-        if not self.session_prompt_name:
-            raise RuntimeError("Session prompt not initialized")
-        content_name = str(uuid.uuid4())
-        await self._send_event(
-            {
-                "event": {
-                    "contentStart": {
-                        "promptName": self.session_prompt_name,
-                        "contentName": content_name,
-                        "type": "TEXT",
-                        "interactive": True,
-                        "role": "USER",
-                        "textInputConfiguration": {"mediaType": "text/plain"},
-                    }
-                }
-            }
-        )
-        await self._send_event(
-            {
-                "event": {
-                    "textInput": {
-                        "promptName": self.session_prompt_name,
-                        "contentName": content_name,
-                        "content": text,
-                    }
-                }
-            }
-        )
-        await self._send_event(
-            {
-                "event": {
-                    "contentEnd": {
-                        "promptName": self.session_prompt_name,
-                        "contentName": content_name,
-                    }
-                }
-            }
-        )
-
-    async def _start_continuous_audio_input(self) -> None:
-        if not self.session_prompt_name:
-            raise RuntimeError("Session prompt not initialized")
-
-        self.audio_input_content_name = str(uuid.uuid4())
-        await self._send_event(
-            {
-                "event": {
-                    "contentStart": {
-                        "promptName": self.session_prompt_name,
-                        "contentName": self.audio_input_content_name,
-                        "type": "AUDIO",
-                        "interactive": True,
-                        "role": "USER",
-                        "audioInputConfiguration": self._audio_input_config(),
-                    }
-                }
-            }
-        )
-        self.mic_task = asyncio.create_task(self._mic_capture_loop())
-
-    async def _stop_continuous_audio_input(self) -> None:
-        if self.mic_task and not self.mic_task.done():
-            self.mic_task.cancel()
-            await asyncio.gather(self.mic_task, return_exceptions=True)
-        self.mic_task = None
-
-        if self.session_prompt_name and self.audio_input_content_name:
-            await self._send_event(
-                {
+                    continue
+                if audio_bytes is None:
+                    break
+                blob = base64.b64encode(audio_bytes).decode("utf-8")
+                await self._send_event({
                     "event": {
-                        "contentEnd": {
-                            "promptName": self.session_prompt_name,
-                            "contentName": self.audio_input_content_name,
+                        "audioInput": {
+                            "promptName": self.prompt_name,
+                            "contentName": self.audio_content_name,
+                            "content": blob,
                         }
                     }
-                }
-            )
-        self.audio_input_content_name = None
+                })
+        except asyncio.CancelledError:
+            pass
 
-    async def _mic_capture_loop(self) -> None:
-        p = pyaudio.PyAudio()
-        stream = p.open(
+    # ── PyAudio I/O ──────────────────────────────────────────────────────────
+    def _start_audio_io(self) -> None:
+        """Open mic input (callback-based) and speaker output streams."""
+        self._pa = pyaudio.PyAudio()
+
+        # Mic input with callback
+        kwargs: dict[str, Any] = dict(
             format=FORMAT,
             channels=CHANNELS,
             rate=INPUT_SAMPLE_RATE,
             input=True,
             frames_per_buffer=CHUNK_SIZE,
-            input_device_index=self.input_device_index,
+            stream_callback=self._mic_callback,
         )
-        silent_chunk = b"\x00\x00" * CHUNK_SIZE
-        try:
-            while self.is_active and self.session_prompt_name and self.audio_input_content_name:
-                data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                if not self.capture_enabled:
-                    data = silent_chunk
-                blob = base64.b64encode(data).decode("utf-8")
-                await self._send_event(
-                    {
-                        "event": {
-                            "audioInput": {
-                                "promptName": self.session_prompt_name,
-                                "contentName": self.audio_input_content_name,
-                                "content": blob,
-                            }
-                        }
-                    }
-                )
-        except asyncio.CancelledError:
-            pass
-        finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
+        if self.input_device_index is not None:
+            kwargs["input_device_index"] = self.input_device_index
+        self._input_stream = self._pa.open(**kwargs)
 
-    async def start_session(self, system_prompt: str) -> None:
-        if not self.client:
-            self._initialize_client()
-
-        self.stream = await self.client.invoke_model_with_bidirectional_stream(
-            InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
-        )
-        self.is_active = True
-
-        self.response_task = asyncio.create_task(self._process_responses())
-        self.playback_task = asyncio.create_task(self._play_audio())
-
-        await self._send_event(
-            {
-                "event": {
-                    "sessionStart": {
-                        "inferenceConfiguration": {
-                            "maxTokens": 1024,
-                            "topP": 0.9,
-                            "temperature": 0.2,
-                        }
-                    }
-                }
-            }
-        )
-
-        self.session_prompt_name = str(uuid.uuid4())
-        await self._send_event(
-            {
-                "event": {
-                    "promptStart": {
-                        "promptName": self.session_prompt_name,
-                        "textOutputConfiguration": {"mediaType": "text/plain"},
-                        "audioOutputConfiguration": self._audio_output_config(),
-                    }
-                }
-            }
-        )
-
-        await self._send_system_content(self.session_prompt_name, system_prompt)
-        await self._start_continuous_audio_input()
-        self.capture_enabled = True
-
-    async def end_session(self) -> None:
-        if not self.is_active:
-            return
-
-        self.is_active = False
-        self.capture_enabled = False
-        await self._stop_continuous_audio_input()
-
-        if self.session_prompt_name:
-            await self._send_event(
-                {"event": {"promptEnd": {"promptName": self.session_prompt_name}}}
-            )
-        await self._send_event({"event": {"sessionEnd": {}}})
-        await self.stream.input_stream.close()
-
-        self.session_prompt_name = None
-        await self.audio_out_queue.put(None)
-
-        tasks = [t for t in [self.response_task, self.playback_task] if t]
-        if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=2.0)
-            for t in pending:
-                t.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-
-    async def _process_responses(self) -> None:
-        try:
-            while self.is_active:
-                output = await self.stream.await_output()
-                result = await output[1].receive()
-                if not result.value or not result.value.bytes_:
-                    continue
-
-                payload = json.loads(result.value.bytes_.decode("utf-8"))
-                event = payload.get("event", {})
-                if self.debug_events and event:
-                    print(f"[Event] {', '.join(event.keys())}")
-
-                if "contentStart" in event:
-                    cs = event["contentStart"]
-                    p = cs.get("promptName", "")
-                    c = cs.get("contentName", "")
-                    r = cs.get("role", "")
-                    if p and c and r:
-                        self.content_roles[(p, c)] = r
-                    await self._append_event(
-                        {
-                            "type": "contentStart",
-                            "promptName": p,
-                            "contentName": c,
-                            "role": r,
-                        }
-                    )
-
-                elif "textOutput" in event:
-                    to = event["textOutput"]
-                    p = to.get("promptName", "")
-                    c = to.get("contentName", "")
-                    text = to.get("content", "")
-                    role = to.get("role") or self.content_roles.get((p, c), "UNKNOWN")
-                    await self._append_event(
-                        {
-                            "type": "textOutput",
-                            "promptName": p,
-                            "contentName": c,
-                            "role": role,
-                            "text": text,
-                        }
-                    )
-                    if text:
-                        print(f"[{role}] {text}")
-                        self.transcript.append({"role": role, "text": text.strip()})
-                        normalized = text.strip()
-                        if role in {"USER", "UNKNOWN"} and normalized and normalized != self._last_user_text:
-                            self._last_user_text = normalized
-                            await self.user_text_queue.put(normalized)
-                        if role in {"ASSISTANT", "UNKNOWN"} and normalized:
-                            await self.assistant_text_queue.put(normalized)
-
-                elif "audioOutput" in event:
-                    ao = event["audioOutput"]
-                    audio_b64 = ao.get("content")
-                    if audio_b64:
-                        audio_bytes = base64.b64decode(audio_b64)
-                        if self.debug_audio:
-                            print(f"[AudioOutput] bytes={len(audio_bytes)}")
-                        await self.audio_out_queue.put(audio_bytes)
-
-                elif "contentEnd" in event:
-                    ce = event["contentEnd"]
-                    p = ce.get("promptName", "")
-                    c = ce.get("contentName", "")
-                    role = self.content_roles.get((p, c), "UNKNOWN")
-                    await self._append_event(
-                        {
-                            "type": "contentEnd",
-                            "promptName": p,
-                            "contentName": c,
-                            "role": role,
-                        }
-                    )
-
-                elif "error" in event:
-                    await self._append_event({"type": "error", "payload": event["error"]})
-                    print(f"[Stream error] {event['error']}")
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            print(f"[Response loop error] {exc}")
-
-    async def _play_audio(self) -> None:
-        p = pyaudio.PyAudio()
-        stream = p.open(
+        # Speaker output (blocking write, driven from playback task)
+        out_kwargs: dict[str, Any] = dict(
             format=FORMAT,
             channels=CHANNELS,
             rate=OUTPUT_SAMPLE_RATE,
             output=True,
-            frames_per_buffer=4096,
-            output_device_index=self.output_device_index,
+            frames_per_buffer=CHUNK_SIZE,
         )
+        if self.output_device_index is not None:
+            out_kwargs["output_device_index"] = self.output_device_index
+        self._output_stream = self._pa.open(**out_kwargs)
+
+        # Start playback task
+        self._playback_task = asyncio.create_task(self._playback_loop())
+
+    def _mic_callback(self, in_data, frame_count, time_info, status):
+        """PyAudio callback – push mic data into asyncio queue."""
+        if self.is_active and in_data:
+            try:
+                self.audio_input_queue.put_nowait(in_data)
+            except Exception:
+                pass
+        return (None, pyaudio.paContinue)
+
+    def _stop_audio_input(self) -> None:
+        if self._input_stream:
+            try:
+                if self._input_stream.is_active():
+                    self._input_stream.stop_stream()
+                self._input_stream.close()
+            except Exception:
+                pass
+            self._input_stream = None
+
+    def _stop_audio_output(self) -> None:
+        if self._output_stream:
+            try:
+                if self._output_stream.is_active():
+                    self._output_stream.stop_stream()
+                self._output_stream.close()
+            except Exception:
+                pass
+            self._output_stream = None
+        if self._pa:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
+
+    async def _playback_loop(self) -> None:
+        """Read from audio_output_queue and write to speaker."""
+        loop = asyncio.get_event_loop()
         try:
             while True:
-                data = await self.audio_out_queue.get()
+                data = await self.audio_output_queue.get()
                 if data is None:
                     break
-                await asyncio.get_event_loop().run_in_executor(None, stream.write, data)
+                # Handle barge-in: flush queue
+                if self.barge_in:
+                    while not self.audio_output_queue.empty():
+                        try:
+                            self.audio_output_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    self.barge_in = False
+                    continue
+                if self._output_stream and not self._output_stream.is_stopped:
+                    await loop.run_in_executor(None, self._output_stream.write, data)
         except asyncio.CancelledError:
             pass
-        finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
 
-    async def _drain_user_queue(self) -> None:
-        while True:
-            try:
-                self.user_text_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+    # ── High-level helpers for the state machine ─────────────────────────────
+    def get_latest_user_text(self) -> str:
+        """Return the most recent user transcript text and clear the buffer."""
+        if self.user_text_parts:
+            text = self.user_text_parts[-1]
+            self.user_text_parts.clear()
+            return text
+        return ""
 
-    async def _drain_assistant_queue(self) -> None:
-        while True:
-            try:
-                self.assistant_text_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+    def get_all_assistant_text(self) -> str:
+        """Return all assistant text since last clear."""
+        text = " ".join(self.assistant_text_parts)
+        self.assistant_text_parts.clear()
+        return text
 
-    async def send_text_instruction(self, text: str) -> None:
-        await self._send_user_text(text)
+    async def instruct_and_wait_for_speech(self, instruction: str, wait_s: float = 8.0) -> None:
+        """Send a text instruction and wait for the model to finish speaking."""
+        self.assistant_text_parts.clear()
+        self.user_text_parts.clear()
+        await self.send_text(instruction)
+        # Wait for assistant to produce audio output
+        await asyncio.sleep(wait_s)
 
-    async def wait_for_assistant_phrase(
-        self, phrases: list[str], timeout_s: float = 120.0
-    ) -> tuple[bool, str]:
-        lower_phrases = [p.lower() for p in phrases]
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout_s
-        while loop.time() < deadline:
-            wait_left = max(0.0, deadline - loop.time())
-            try:
-                text = await asyncio.wait_for(
-                    self.assistant_text_queue.get(), timeout=min(0.5, wait_left)
-                )
-            except asyncio.TimeoutError:
-                continue
-            low = text.lower()
-            if any(p in low for p in lower_phrases):
-                return True, text
-        return False, ""
-
-    async def wait_for_user_utterance(self, timeout_s: float = 12.0, settle_s: float = 0.9) -> str:
-        print("[Mic] Listening...")
-        self.capture_enabled = True
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout_s
-        latest = ""
+    async def wait_for_user_response(self, timeout_s: float = 15.0, settle_s: float = 1.5) -> str:
+        """Wait for user speech, with settle time after last transcript update."""
+        self.user_text_parts.clear()
+        deadline = asyncio.get_event_loop().time() + timeout_s
         last_update = 0.0
+        latest = ""
 
-        while loop.time() < deadline:
-            wait_left = max(0.0, deadline - loop.time())
-            try:
-                candidate = await asyncio.wait_for(
-                    self.user_text_queue.get(), timeout=min(0.4, wait_left)
-                )
-                latest = candidate.strip()
-                last_update = loop.time()
-            except asyncio.TimeoutError:
-                if latest and last_update and (loop.time() - last_update) >= settle_s:
-                    self.capture_enabled = False
-                    return latest
-                continue
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.3)
+            if self.user_text_parts:
+                latest = self.user_text_parts[-1]
+                last_update = asyncio.get_event_loop().time()
+                self.user_text_parts.clear()
+            elif latest and last_update and (asyncio.get_event_loop().time() - last_update) >= settle_s:
+                return latest
 
-        self.capture_enabled = False
         return latest
 
-    async def speak_text(self, text: str, language: str, timeout_s: float = 10.0) -> PromptResult:
-        if not self.session_prompt_name:
-            raise RuntimeError("No active prompt. Call start_session first.")
-        self.capture_enabled = False
-        mark = self._event_mark()
-        await self._send_user_text(
-            f"Speak to the user in {language}. Say exactly this sentence and nothing else: {text}"
-        )
 
-        await self._wait_for(
-            lambda e: e.get("type") == "textOutput"
-            and e.get("promptName") == self.session_prompt_name
-            and e.get("role") in {"ASSISTANT", "UNKNOWN"}
-            and bool(e.get("text")),
-            mark,
-            timeout_s,
-        )
+# ═══════════════════════════════════════════════════════════════════════════════
+#  S3 Integration
+# ═══════════════════════════════════════════════════════════════════════════════
+class S3Uploader:
+    """Pluggable S3 upload functions for cough WAV and final JSON."""
 
-        assistant_text = " ".join(
-            ev["text"]
-            for ev in self.events[mark:]
-            if ev.get("type") == "textOutput"
-            and ev.get("promptName") == self.session_prompt_name
-            and ev.get("role") in {"ASSISTANT", "UNKNOWN"}
-            and ev.get("text")
-        ).strip()
+    def __init__(self, bucket: str, region: str):
+        self.bucket = bucket
+        self.s3 = boto3.client("s3", region_name=region)
 
-        if not assistant_text:
-            print(f"[Assistant fallback] {text}")
+    def upload_cough_wav(self, local_path: str) -> str:
+        """Upload cough WAV file, return s3:// URI."""
+        key = f"health-intake/cough/{uuid.uuid4()}.wav"
+        self.s3.upload_file(local_path, self.bucket, key)
+        uri = f"s3://{self.bucket}/{key}"
+        log_info(f"Cough WAV uploaded → {uri}")
+        return uri
 
-        return PromptResult(prompt_name=self.session_prompt_name, assistant_text=assistant_text, user_text="")
-
-    async def ask_question(self, question_english: str, language: str, timeout_s: float = 30.0) -> PromptResult:
-        if not self.session_prompt_name:
-            raise RuntimeError("No active prompt. Call start_session first.")
-        self.capture_enabled = False
-        mark = self._event_mark()
-        await self._drain_user_queue()
-
-        await self._send_user_text(
-            "Ask exactly one short intake question in "
-            f"{language}. Keep meaning exactly as: {question_english}. Do not add extra sentences."
-        )
-        user_text = await self.wait_for_user_utterance(timeout_s=12.0)
-        if not user_text.strip():
-            user_text = await self.wait_for_user_utterance(timeout_s=7.0)
-
-        await self._wait_for(
-            lambda e: e.get("type") == "textOutput"
-            and e.get("promptName") == self.session_prompt_name
-            and e.get("role") in {"ASSISTANT", "UNKNOWN"}
-            and bool(e.get("text")),
-            mark,
-            min(timeout_s, 1.5),
-        )
-
-        assistant_text = " ".join(
-            ev["text"]
-            for ev in self.events[mark:]
-            if ev.get("type") == "textOutput"
-            and ev.get("promptName") == self.session_prompt_name
-            and ev.get("role") in {"ASSISTANT", "UNKNOWN"}
-            and ev.get("text")
-        ).strip()
-
-        return PromptResult(prompt_name=self.session_prompt_name, assistant_text=assistant_text, user_text=user_text)
-
-    async def text_only_assistant(self, instruction: str, timeout_s: float = 10.0) -> str:
-        if not self.session_prompt_name:
-            raise RuntimeError("No active prompt. Call start_session first.")
-        self.capture_enabled = False
-        mark = self._event_mark()
-        await self._send_user_text(instruction)
-
-        await self._wait_for(
-            lambda e: e.get("type") == "textOutput"
-            and e.get("promptName") == self.session_prompt_name
-            and e.get("role") in {"ASSISTANT", "UNKNOWN"}
-            and bool(e.get("text")),
-            mark,
-            timeout_s,
-        )
-        return " ".join(
-            ev["text"]
-            for ev in self.events[mark:]
-            if ev.get("type") == "textOutput"
-            and ev.get("promptName") == self.session_prompt_name
-            and ev.get("role") in {"ASSISTANT", "UNKNOWN"}
-            and ev.get("text")
-        ).strip()
+    def upload_final_json(self, payload: dict) -> str:
+        """Upload final JSON payload, return s3:// URI."""
+        key = f"health-intake/json/{uuid.uuid4()}.json"
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=body, ContentType="application/json")
+        uri = f"s3://{self.bucket}/{key}"
+        log_info(f"Final JSON uploaded → {uri}")
+        return uri
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Cough Recording (offline, after Nova session ends)
+# ═══════════════════════════════════════════════════════════════════════════════
+def record_cough_wav(
+    out_path: str,
+    seconds: int = 8,
+    input_device_index: Optional[int] = None,
+) -> tuple[bool, int]:
+    """
+    Record cough audio to WAV. Returns (valid, burst_count).
+    Validates via RMS threshold heuristic.
+    """
+    p = pyaudio.PyAudio()
+    kwargs: dict[str, Any] = dict(
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=INPUT_SAMPLE_RATE,
+        input=True,
+        frames_per_buffer=CHUNK_SIZE,
+    )
+    if input_device_index is not None:
+        kwargs["input_device_index"] = input_device_index
+
+    stream = None
+    try:
+        stream = p.open(**kwargs)
+        frames: list[bytes] = []
+        rms_values: list[float] = []
+
+        # Beep
+        print("\a", end="", flush=True)
+        log_info(f"Recording cough for {seconds}s... cough now!")
+
+        total_chunks = int(INPUT_SAMPLE_RATE / CHUNK_SIZE * seconds)
+        for _ in range(total_chunks):
+            data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            frames.append(data)
+            rms_values.append(pcm16_rms(data))
+
+        # Write WAV
+        with wave.open(out_path, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(INPUT_SAMPLE_RATE)
+            wf.writeframes(b"".join(frames))
+
+        log_info(f"Cough WAV saved: {out_path}")
+
+        # Validate cough bursts
+        valid, count = _validate_cough_bursts(rms_values)
+        log_info(f"Cough validation: valid={valid}, bursts={count}")
+        return valid, count
+
+    finally:
+        if stream:
+            stream.stop_stream()
+            stream.close()
+        p.terminate()
+
+
+def _validate_cough_bursts(rms_values: list[float]) -> tuple[bool, int]:
+    """Heuristic: count RMS spikes above threshold as cough bursts."""
+    if not rms_values:
+        return False, 0
+    peak = max(rms_values)
+    median = sorted(rms_values)[len(rms_values) // 2]
+    threshold = max(800.0, median * 2.5, peak * 0.4)
+
+    count = 0
+    cooldown = 0
+    for v in rms_values:
+        if cooldown > 0:
+            cooldown -= 1
+            continue
+        if v >= threshold:
+            count += 1
+            cooldown = 8  # ~0.5s at 16kHz/1024 chunk
+
+    return count >= 3, count
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Health Intake Agent – Deterministic State Machine
+# ═══════════════════════════════════════════════════════════════════════════════
 class HealthIntakeAgent:
+    """
+    App-controlled turn-taking state machine.
+    States: LANGUAGE_SELECT → ASKING → WAITING_USER → COUGH_PHASE → DONE
+    Asks exactly one question at a time, waits for one answer, then advances.
+    """
+
+    # System prompt keeps the model tightly constrained
+    SYSTEM_PROMPT = (
+        "You are a multilingual health intake voice assistant. "
+        "You MUST speak ONLY in the language the app tells you. "
+        "You MUST say ONLY the exact sentence the app provides. "
+        "Do NOT add extra sentences, greetings, or commentary. "
+        "Do NOT diagnose or give medical advice. "
+        "If told to speak Hindi, use natural Devanagari Hindi, not Hinglish. "
+        "If told to speak English, use only English. "
+        "Keep every response to one short sentence."
+    )
+
+    MAX_RETRIES = 2  # retries per question on timeout/no-input
+
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.nova = NovaSonicBidiClient(
+        self.state = State.LANGUAGE_SELECT
+        self.language: str = "English"  # default
+        self.question_index: int = 0
+        self.answers: dict[str, Any] = {}  # collected answers keyed by field name
+        self.cough_s3_uri: str = ""
+
+        self.nova = NovaSonicClient(
             model_id=args.model_id,
             region=args.region,
             voice_id=args.voice_id,
-            debug_events=args.debug_events,
-            debug_audio=args.debug_audio,
             input_device_index=args.input_device_index,
             output_device_index=args.output_device_index,
         )
-        self.s3 = boto3.client("s3", region_name=args.region)
-        self.translate = boto3.client("translate", region_name=args.region)
-        self.record: dict[str, Any] = {
-            "language": None,
-            "name": None,
-            "age": None,
-            "location": None,
-            "symptoms": {},
-            "medical_history": {},
-            "exposure_history": {},
-            "cough_audio": None,
-            "timestamp": None,
-        }
+        self.s3_uploader = S3Uploader(bucket=args.s3_bucket, region=args.region)
 
-    @staticmethod
-    def _is_skip(text: str) -> bool:
-        t = text.strip().lower()
-        return t in {"skip", "please skip", "स्किप", "छोड़ो", "छोड़िए", "छोड़ दें"}
+    # ── Build the final output JSON ──────────────────────────────────────────
+    def _build_output(self) -> dict:
+        """
+        Build the exact output shape required:
+        {"body": "{\"age\":50,\"gender\":\"M\",...}"}
+        """
+        body: dict[str, Any] = {}
 
-    @staticmethod
-    def _detect_language_choice(text: str) -> Optional[str]:
-        t = text.strip().lower()
-        if any(k in t for k in ["english", "inglish", "अंग्रेज", "एंग्लिश"]):
-            return "English"
-        if any(k in t for k in ["hindi", "हिंदी", "हिन्दी"]):
-            return "Hindi"
-        return None
+        # Name
+        body["name"] = self.answers.get("name", "")
 
-    async def _translate_to_english(self, text: str, source_language: str) -> str:
-        if not text:
-            return ""
-        if source_language.lower() == "english":
-            return text.strip()
-        source_code = "hi" if source_language.lower() == "hindi" else "auto"
-        try:
-            resp = self.translate.translate_text(
-                Text=text,
-                SourceLanguageCode=source_code,
-                TargetLanguageCode="en",
-            )
-            translated = resp.get("TranslatedText", "").strip()
-            return translated or text.strip()
-        except Exception:
-            return text.strip()
+        # Age
+        age = self.answers.get("age")
+        body["age"] = age if isinstance(age, int) else 0
 
-    async def _ask_capture(self, question_en: str) -> tuple[str, str]:
-        language = self.record["language"] or "English"
-        result = await self.nova.ask_question(question_en, language=language)
-        raw = result.user_text.strip()
-        if not raw:
-            return "", ""
-        if self._is_skip(raw):
-            return raw, ""
-        translated = await self._translate_to_english(raw, source_language=language)
-        return raw, translated
+        # Gender
+        body["gender"] = self.answers.get("gender", "U")
 
-    async def _ask_until_value(self, key: str, question_en: str, max_tries: int = 2) -> Optional[str]:
-        for _ in range(max_tries):
-            raw, translated = await self._ask_capture(question_en)
-            if not raw:
-                continue
-            if self._is_skip(raw):
+        # Binary fields: strict 0/1
+        for f in ALL_BINARY_FIELDS:
+            val = self.answers.get(f)
+            if val is None:
+                body[f] = 0  # unknown → safe default
+            else:
+                body[f] = int(val) if isinstance(val, int) else 0
+
+        # Cough S3 URI (extra, outside body string but useful)
+        body_json_str = json.dumps(body, ensure_ascii=False)
+        output = {"body": body_json_str}
+
+        if self.cough_s3_uri:
+            output["cough_audio_s3"] = self.cough_s3_uri
+
+        return output
+
+    # ── Speak a sentence via Nova ────────────────────────────────────────────
+    async def _speak(self, english_text: str, hindi_text: str) -> None:
+        """Instruct Nova to speak the appropriate language version."""
+        if self.language == "Hindi":
+            instruction = f"Speak in Hindi. Say exactly: {hindi_text}"
+        else:
+            instruction = f"Speak in English. Say exactly: {english_text}"
+        await self.nova.instruct_and_wait_for_speech(instruction, wait_s=6.0)
+
+    # ── Ask one question and get answer ──────────────────────────────────────
+    async def _ask_one(self, q: IntakeQuestion) -> Optional[Any]:
+        """
+        Ask a single question, wait for user response.
+        Returns parsed value or None (skip/timeout).
+        Retries up to MAX_RETRIES on no-input.
+        """
+        for attempt in range(self.MAX_RETRIES + 1):
+            self.state = State.ASKING
+
+            # Instruct model to ask the question
+            if self.language == "Hindi":
+                instruction = f"Speak in Hindi. Ask exactly: {q.hindi}"
+            else:
+                instruction = f"Speak in English. Ask exactly: {q.english}"
+
+            self.nova.assistant_text_parts.clear()
+            self.nova.user_text_parts.clear()
+            await self.nova.send_text(instruction)
+
+            # Wait for model to speak the question
+            await asyncio.sleep(5.0)
+
+            # Now wait for user response
+            self.state = State.WAITING_USER
+            user_text = await self.nova.wait_for_user_response(timeout_s=12.0, settle_s=1.5)
+
+            if not user_text.strip():
+                if attempt < self.MAX_RETRIES:
+                    log_info(f"No response for '{q.key}', retrying ({attempt + 1}/{self.MAX_RETRIES})...")
+                    continue
+                else:
+                    log_info(f"No response for '{q.key}' after retries, using default.")
+                    return None
+
+            # Check skip
+            if is_skip(user_text):
+                log_info(f"User skipped '{q.key}'")
                 return None
-            if translated:
-                self.record[key] = translated
-                return translated
+
+            # Parse based on field type
+            if q.field_type == "binary":
+                val = parse_binary(user_text)
+                if val is not None:
+                    return val
+                # Unclear answer – use model to interpret
+                val = await self._model_interpret_binary(user_text)
+                return val
+
+            elif q.field_type == "age":
+                val = parse_age(user_text)
+                if val is not None:
+                    return val
+                # Try model interpretation
+                return await self._model_interpret_age(user_text)
+
+            elif q.field_type == "gender":
+                return parse_gender(user_text)
+
+            else:  # text
+                return user_text.strip()
+
         return None
 
-    async def _collect_demographics(self) -> None:
-        await self._ask_until_value("name", "Please tell me your full name.")
-
-        age_value = None
-        for _ in range(2):
-            raw, translated = await self._ask_capture("How old are you?")
-            if not raw:
-                continue
-            if self._is_skip(raw):
-                break
-            tokens = "".join(ch if ch.isdigit() else " " for ch in translated).split()
-            if tokens:
-                try:
-                    age_value = int(tokens[0])
-                    break
-                except ValueError:
-                    pass
-        self.record["age"] = age_value
-
-        await self._ask_until_value("location", "What is your current city or location?")
-
-    async def _collect_symptoms(self) -> None:
-        symptoms = self.record["symptoms"]
-
-        raw, fever = await self._ask_capture("Do you have fever? Please answer yes or no.")
-        if self._is_skip(raw) or not fever:
-            symptoms["fever"] = None
-        else:
-            yes = fever.lower().startswith("y")
-            symptoms["fever"] = yes
-            if yes:
-                _, temp = await self._ask_capture("What is your temperature, if known?")
-                _, duration = await self._ask_capture("How many days have you had fever?")
-                symptoms["fever_temperature"] = temp or None
-                symptoms["fever_duration"] = duration or None
-
-        raw, cough = await self._ask_capture("Do you have cough? Please say dry, wet, or no cough.")
-        symptoms["cough"] = None if self._is_skip(raw) else (cough or None)
-
-        raw, breathing = await self._ask_capture("Do you have difficulty breathing? Please answer yes or no.")
-        if self._is_skip(raw) or not breathing:
-            symptoms["difficulty_breathing"] = None
-        else:
-            has_breath_issue = breathing.lower().startswith("y")
-            symptoms["difficulty_breathing"] = has_breath_issue
-            if has_breath_issue:
-                _, severity = await self._ask_capture(
-                    "Is the breathing difficulty mild, moderate, or severe?"
-                )
-                symptoms["breathing_severity"] = severity or None
-
-        raw, fatigue = await self._ask_capture("Do you have fatigue? Please answer yes or no.")
-        symptoms["fatigue"] = None if self._is_skip(raw) else (fatigue or None)
-
-        raw, other = await self._ask_capture("Do you have any other symptoms?")
-        symptoms["other_symptoms"] = None if self._is_skip(raw) else (other or None)
-
-        no_symptoms = (
-            symptoms.get("fever") in [False, None]
-            and (symptoms.get("cough") or "").lower() in ["no", "none", "no cough", ""]
-            and symptoms.get("difficulty_breathing") in [False, None]
-            and (symptoms.get("fatigue") or "").lower() in ["no", "none", ""]
-            and not symptoms.get("other_symptoms")
-        )
-        if no_symptoms:
-            _, confirm = await self._ask_capture("To confirm, are you currently without symptoms?")
-            symptoms["no_symptoms_confirmed"] = confirm or None
-
-    async def _collect_history(self) -> None:
-        mh = self.record["medical_history"]
-        _, pre_existing = await self._ask_capture("Do you have any pre-existing medical conditions?")
-        mh["pre_existing_conditions"] = pre_existing or None
-
-        _, meds = await self._ask_capture("Are you currently taking any medications?")
-        mh["current_medications"] = meds or None
-
-    async def _collect_exposure(self) -> None:
-        ex = self.record["exposure_history"]
-        _, sick_contact = await self._ask_capture(
-            "Have you had recent contact with someone who was sick?"
-        )
-        ex["recent_sick_contact"] = sick_contact or None
-
-        _, travel = await self._ask_capture("Have you traveled recently?")
-        ex["recent_travel"] = travel or None
-
-    @staticmethod
-    def _validate_cough_from_rms(rms_values: list[int]) -> tuple[bool, int]:
-        if not rms_values:
-            return False, 0
-        peak = max(rms_values)
-        baseline = sorted(rms_values)[len(rms_values) // 2]
-        threshold = max(800, int(baseline * 2.2), int(peak * 0.45))
-
-        cough_count = 0
-        cooldown = 0
-        for v in rms_values:
-            if cooldown > 0:
-                cooldown -= 1
-                continue
-            if v >= threshold:
-                cough_count += 1
-                cooldown = 8
-
-        return cough_count >= 3, cough_count
-
-    def _open_input_stream_with_fallback(self, p: pyaudio.PyAudio):
-        try:
-            return p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=INPUT_SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-                input_device_index=self.args.input_device_index,
-            )
-        except Exception:
-            return p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=INPUT_SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-            )
-
-    def _record_cough_wav(self, out_path: str, seconds: int = 8) -> tuple[bool, int]:
-        attempts = 2
-        last_exc: Optional[Exception] = None
-
-        for attempt in range(1, attempts + 1):
-            p = pyaudio.PyAudio()
-            stream = None
-            try:
-                stream = self._open_input_stream_with_fallback(p)
-                frames: list[bytes] = []
-                rms_values: list[int] = []
-
-                print("[Cough] Beep... now cough three times.")
-                print("\a", end="", flush=True)
-
-                for _ in range(int(INPUT_SAMPLE_RATE / CHUNK_SIZE * seconds)):
-                    data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                    frames.append(data)
-                    rms_values.append(pcm16_rms(data))
-
-                with wave.open(out_path, "wb") as wf:
-                    wf.setnchannels(CHANNELS)
-                    wf.setsampwidth(2)
-                    wf.setframerate(INPUT_SAMPLE_RATE)
-                    wf.writeframes(b"".join(frames))
-
-                return self._validate_cough_from_rms(rms_values)
-            except Exception as exc:
-                last_exc = exc
-                print(f"[Cough recording warning] attempt {attempt} failed: {exc}")
-                time.sleep(0.5)
-            finally:
-                if stream is not None:
-                    stream.stop_stream()
-                    stream.close()
-                p.terminate()
-
-        if last_exc:
-            raise RuntimeError(f"Failed to record cough audio: {last_exc}")
-        raise RuntimeError("Failed to record cough audio")
-
-    def _upload_file_to_s3(self, local_path: str, key: str) -> str:
-        bucket = self.args.s3_bucket
-        if not bucket:
-            raise ValueError("--s3-bucket is required for S3 uploads")
-
-        self.s3.upload_file(local_path, bucket, key)
-        return f"s3://{bucket}/{key}"
-
-    def _upload_json_to_s3(self, payload: dict[str, Any], key: str) -> str:
-        bucket = self.args.s3_bucket
-        if not bucket:
-            raise ValueError("--s3-bucket is required for S3 uploads")
-
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self.s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=body,
-            ContentType="application/json",
-        )
-        return f"s3://{bucket}/{key}"
-
-    async def _extract_structured_from_transcript(self) -> dict[str, Any]:
-        lines = []
-        for turn in self.nova.transcript[-200:]:
-            role = turn.get("role", "UNKNOWN")
-            text = turn.get("text", "")
-            if text:
-                lines.append(f"{role}: {text}")
-        transcript_text = "\\n".join(lines)
-
+    async def _model_interpret_binary(self, text: str) -> Optional[int]:
+        """Ask the model to interpret an ambiguous yes/no answer."""
         instruction = (
-            "Extract a structured English health intake JSON from the transcript. "
-            "Return JSON only, no markdown. Use this schema keys exactly: "
-            "language, name, age, location, symptoms, medical_history, exposure_history. "
-            "Use null for unknown. For symptoms, include fever, fever_temperature, fever_duration, "
-            "cough, difficulty_breathing, breathing_severity, fatigue, other_symptoms. "
-            "For medical_history include pre_existing_conditions and current_medications. "
-            "For exposure_history include recent_sick_contact and recent_travel. "
-            f"Transcript:\\n{transcript_text}"
+            f"The user was asked a yes/no health question and answered: \"{text}\". "
+            "Reply with ONLY the word 'yes' or 'no'. Nothing else."
         )
-        raw = await self.nova.text_only_assistant(instruction, timeout_s=20.0)
-        if not raw:
-            return {}
-        try:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start >= 0 and end > start:
-                return json.loads(raw[start : end + 1])
-        except Exception:
-            return {}
-        return {}
+        await self.nova.send_text(instruction)
+        await asyncio.sleep(3.0)
+        response = self.nova.get_all_assistant_text().strip().lower()
+        if "yes" in response:
+            return 1
+        if "no" in response:
+            return 0
+        return None
 
-    async def run(self) -> None:
-        await self.nova.start_session(HEALTH_SYSTEM_PROMPT)
-
-        await self.nova.send_text_instruction(
-            "Start the live health intake call now. "
-            "First ask exactly: Please choose your language: English or Hindi? "
-            "Then continue the complete intake conversation in the selected language. "
-            "If Hindi is selected, use clear native Hindi wording (Devanagari) and avoid English words. "
-            "If English is selected, use only English. "
-            "Ask one question at a time and adapt based on responses. "
-            "Allow skip. Collect: name, age, location, symptoms, medical history, exposure history. "
-            "When done, say exactly: Now I will record your cough. Please cough three times after the beep."
+    async def _model_interpret_age(self, text: str) -> Optional[int]:
+        """Ask the model to extract age from ambiguous text."""
+        instruction = (
+            f"The user was asked their age and answered: \"{text}\". "
+            "Reply with ONLY the number. Nothing else."
         )
+        await self.nova.send_text(instruction)
+        await asyncio.sleep(3.0)
+        response = self.nova.get_all_assistant_text().strip()
+        return parse_age(response)
 
-        detected, _ = await self.nova.wait_for_assistant_phrase(
-            ["now i will record your cough", "please cough three times after the beep"],
-            timeout_s=300.0,
-        )
-        if not detected:
-            raise RuntimeError("Conversation timeout: cough phase trigger was not reached.")
-
-        await self.nova.end_session()
-
-        # Derive structured fields from transcript (English JSON).
-        await self.nova.start_session(HEALTH_SYSTEM_PROMPT)
-        extracted = await self._extract_structured_from_transcript()
-        await self.nova.end_session()
-        if isinstance(extracted, dict):
-            self.record.update(
-                {
-                    "language": extracted.get("language") or self.record.get("language"),
-                    "name": extracted.get("name") or self.record.get("name"),
-                    "age": extracted.get("age") if extracted.get("age") is not None else self.record.get("age"),
-                    "location": extracted.get("location") or self.record.get("location"),
-                    "symptoms": extracted.get("symptoms") or self.record.get("symptoms", {}),
-                    "medical_history": extracted.get("medical_history")
-                    or self.record.get("medical_history", {}),
-                    "exposure_history": extracted.get("exposure_history")
-                    or self.record.get("exposure_history", {}),
-                }
+    # ── Language selection phase ──────────────────────────────────────────────
+    async def _select_language(self) -> None:
+        """Ask user to choose English or Hindi."""
+        for attempt in range(self.MAX_RETRIES + 1):
+            instruction = (
+                "Speak in English. Say exactly: "
+                "Please choose your language: English or Hindi?"
             )
+            self.nova.assistant_text_parts.clear()
+            self.nova.user_text_parts.clear()
+            await self.nova.send_text(instruction)
+            await asyncio.sleep(5.0)
 
-        cough_local_path = self.args.cough_wav
-        valid_cough, cough_count = self._record_cough_wav(cough_local_path)
-        print(f"[Cough validation] valid={valid_cough}, detected_bursts={cough_count}")
+            user_text = await self.nova.wait_for_user_response(timeout_s=10.0, settle_s=1.5)
 
-        cough_key = f"health-intake/cough/{uuid.uuid4()}.wav"
-        cough_s3 = self._upload_file_to_s3(cough_local_path, cough_key)
-        self.record["cough_audio"] = cough_s3
+            if user_text.strip():
+                choice = detect_language_choice(user_text)
+                if choice:
+                    self.language = choice
+                    log_info(f"Language selected: {self.language}")
+                    # Confirm
+                    if self.language == "Hindi":
+                        await self._speak(
+                            "You selected Hindi. Let us begin.",
+                            "आपने हिंदी चुनी है। चलिए शुरू करते हैं।"
+                        )
+                    else:
+                        await self._speak(
+                            "You selected English. Let us begin.",
+                            "You selected English. Let us begin."
+                        )
+                    return
 
-        self.record["timestamp"] = datetime.now(timezone.utc).isoformat()
+            if attempt < self.MAX_RETRIES:
+                log_info(f"Language not detected, retrying ({attempt + 1})...")
+            else:
+                log_info("Defaulting to English.")
+                self.language = "English"
 
-        json_key = f"health-intake/json/{uuid.uuid4()}.json"
-        json_s3 = self._upload_json_to_s3(self.record, json_key)
+    # ── Cough phase ──────────────────────────────────────────────────────────
+    async def _cough_phase(self) -> None:
+        """Announce cough recording, close Nova session, record WAV, upload."""
+        self.state = State.COUGH_PHASE
 
-        await self.nova.start_session(HEALTH_SYSTEM_PROMPT)
-        await self.nova.speak_text("Thank you, your assessment is complete.", language="English")
-        await asyncio.sleep(0.8)
-        await self.nova.end_session()
+        # Speak the cough instruction
+        await self._speak(
+            "Now I will record your cough. Please cough three times after the beep.",
+            "अब मैं आपकी खांसी रिकॉर्ड करूँगा। बीप के बाद कृपया तीन बार खांसें।"
+        )
 
-        print("\nFinal intake JSON:")
-        print(json.dumps(self.record, ensure_ascii=False, indent=2))
-        print(f"\nJSON uploaded to: {json_s3}")
+        # Wait for speech to finish playing
+        await asyncio.sleep(2.0)
+
+        # End Nova session cleanly BEFORE recording
+        log_info("Closing Nova session for cough recording...")
+        await self.nova.close_session()
+        await asyncio.sleep(0.5)
+
+        # Record cough WAV
+        cough_path = "cough_recording.wav"
+        cough_seconds = self.args.cough_seconds
+        valid, burst_count = record_cough_wav(
+            cough_path,
+            seconds=cough_seconds,
+            input_device_index=self.args.input_device_index,
+        )
+        log_info(f"Cough recording: valid={valid}, bursts={burst_count}")
+
+        # Upload to S3
+        self.cough_s3_uri = self.s3_uploader.upload_cough_wav(cough_path)
+
+    # ── Main run loop ────────────────────────────────────────────────────────
+    async def run(self) -> dict:
+        """Execute the full intake flow. Returns the final output dict."""
+        try:
+            # Open Nova session
+            await self.nova.open_session(self.SYSTEM_PROMPT)
+
+            # 1) Language selection
+            self.state = State.LANGUAGE_SELECT
+            await self._select_language()
+
+            # 2) Ask each intake question sequentially
+            for i, q in enumerate(INTAKE_QUESTIONS):
+                self.question_index = i
+                log_info(f"Question {i + 1}/{len(INTAKE_QUESTIONS)}: {q.key}")
+                value = await self._ask_one(q)
+                self.answers[q.key] = value
+                log_info(f"  → {q.key} = {value}")
+
+            # 3) Cough phase
+            await self._cough_phase()
+
+            # 4) Thank the user (reopen session briefly)
+            await self.nova.open_session(self.SYSTEM_PROMPT)
+            await self._speak(
+                "Thank you. Your health intake is complete.",
+                "धन्यवाद। आपका स्वास्थ्य सेवन पूरा हो गया है।"
+            )
+            await asyncio.sleep(3.0)
+            await self.nova.close_session()
+
+            # 5) Build and upload final JSON
+            self.state = State.DONE
+            output = self._build_output()
+
+            # Upload
+            json_s3 = self.s3_uploader.upload_final_json(output)
+
+            # Print
+            print("\n" + "=" * 60)
+            print("FINAL OUTPUT:")
+            print("=" * 60)
+            print(json.dumps(output, indent=2, ensure_ascii=False))
+            print(f"\nJSON uploaded to: {json_s3}")
+            print(f"Cough audio: {self.cough_s3_uri}")
+            print("=" * 60)
+
+            return output
+
+        except KeyboardInterrupt:
+            log_info("Interrupted by user")
+            raise
+        except Exception as e:
+            log_info(f"Agent error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        finally:
+            # Ensure cleanup
+            try:
+                await self.nova.close_session()
+            except Exception:
+                pass
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="AWS Nova 2 Sonic Health Intake Agent")
-    parser.add_argument("--region", default=os.getenv("AWS_REGION", "us-east-1"))
-    parser.add_argument("--model-id", default="amazon.nova-2-sonic-v1:0")
-    parser.add_argument("--voice-id", default="matthew")
-    parser.add_argument("--s3-bucket", required=True)
-    parser.add_argument("--cough-wav", default="cough_recording.wav")
-    parser.add_argument("--debug-events", action="store_true")
-    parser.add_argument("--debug-audio", action="store_true")
-    parser.add_argument("--input-device-index", type=int, default=None)
-    parser.add_argument("--output-device-index", type=int, default=None)
-    parser.add_argument("--list-audio-devices", action="store_true")
-    return parser.parse_args()
-
-
-def print_audio_devices() -> None:
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CLI & Entry Point
+# ═══════════════════════════════════════════════════════════════════════════════
+def list_audio_devices() -> None:
+    """Print all available audio devices."""
     p = pyaudio.PyAudio()
     try:
-        count = p.get_device_count()
-        print(f"Detected {count} audio devices:")
-        for i in range(count):
+        n = p.get_device_count()
+        print(f"\nDetected {n} audio device(s):\n")
+        for i in range(n):
             info = p.get_device_info_by_index(i)
-            name = info.get("name", "unknown")
+            name = info.get("name", "?")
             in_ch = int(info.get("maxInputChannels", 0))
             out_ch = int(info.get("maxOutputChannels", 0))
-            default_sr = int(info.get("defaultSampleRate", 0))
-            print(f"[{i}] {name} | input_ch={in_ch} output_ch={out_ch} default_sr={default_sr}")
+            sr = int(info.get("defaultSampleRate", 0))
+            marker = ""
+            if in_ch > 0 and out_ch > 0:
+                marker = " [IN+OUT]"
+            elif in_ch > 0:
+                marker = " [IN]"
+            elif out_ch > 0:
+                marker = " [OUT]"
+            print(f"  [{i}] {name}  in={in_ch} out={out_ch} sr={sr}{marker}")
+        print()
     finally:
         p.terminate()
 
 
-async def main() -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Nova 2 Sonic – Multilingual Health Intake Voice Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # macOS
+  python nova_sonic_health_intake_agent.py --s3-bucket my-health-bucket --voice-id arjun
+
+  # Windows
+  python nova_sonic_health_intake_agent.py --s3-bucket my-health-bucket --voice-id arjun --input-device-index 1
+
+  # List audio devices
+  python nova_sonic_health_intake_agent.py --list-audio-devices --s3-bucket dummy
+
+  # Debug mode
+  python nova_sonic_health_intake_agent.py --s3-bucket my-bucket --debug-events --debug-audio
+""",
+    )
+    parser.add_argument("--s3-bucket", required=True, help="S3 bucket for uploads (required)")
+    parser.add_argument("--model-id", default="amazon.nova-2-sonic-v1:0", help="Bedrock model ID")
+    parser.add_argument("--region", default=os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1")),
+                        help="AWS region (default: from env or us-east-1)")
+    parser.add_argument("--voice-id", default="arjun", help="Nova Sonic voice ID (default: arjun)")
+    parser.add_argument("--input-device-index", type=int, default=None, help="PyAudio input device index")
+    parser.add_argument("--output-device-index", type=int, default=None, help="PyAudio output device index")
+    parser.add_argument("--cough-seconds", type=int, default=8, help="Cough recording duration in seconds (default: 8)")
+    parser.add_argument("--debug-events", action="store_true", help="Log all streaming events")
+    parser.add_argument("--debug-audio", action="store_true", help="Log audio chunk details")
+    parser.add_argument("--list-audio-devices", action="store_true", help="List audio devices and exit")
+    return parser.parse_args()
+
+
+async def async_main() -> None:
     args = parse_args()
+
+    # Set debug flags
+    global DEBUG_EVENTS, DEBUG_AUDIO
+    DEBUG_EVENTS = args.debug_events
+    DEBUG_AUDIO = args.debug_audio
+
     if args.list_audio_devices:
-        print_audio_devices()
+        list_audio_devices()
         return
+
+    print()
+    print("=" * 60)
+    print("  Nova 2 Sonic – Health Intake Voice Agent")
+    print(f"  Model:  {args.model_id}")
+    print(f"  Region: {args.region}")
+    print(f"  Voice:  {args.voice_id}")
+    print(f"  Bucket: {args.s3_bucket}")
+    print("=" * 60)
+    print()
+
     agent = HealthIntakeAgent(args)
     await agent.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        print("\nExiting.")
+    except Exception as e:
+        print(f"\nFatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
