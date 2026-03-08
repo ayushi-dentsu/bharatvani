@@ -1,78 +1,71 @@
-import React, { useState, useEffect } from 'react';
-import { getRecentScreenings, getScreeningStats } from '../services/dynamoService';
-import { getLambdaMetrics } from '../services/lambdaService';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
-
 export default function Dashboard() {
-  const [screenings, setScreenings] = useState([]);
-  const [stats, setStats] = useState(null);
-  const [metrics, setMetrics] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const {
+    screenings: ecsScreenings,
+    metrics: ecsMetrics,
+    connectionStatus,
+  } = useEcsLiveEvents();
 
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 30000); // Refresh every 30s
-    return () => clearInterval(interval);
-  }, []);
+  // Risk Distribution chart data
+  const riskCounts = ecsScreenings.reduce((acc, s) => {
+    acc[s.combined_risk] = (acc[s.combined_risk] || 0) + 1;
+    return acc;
+  }, {});
 
-  const loadData = async () => {
-    try {
-      const [screeningsData, statsData, metricsData] = await Promise.all([
-        getRecentScreenings(20),
-        getScreeningStats(),
-        getLambdaMetrics()
-      ]);
-      
-      setScreenings(screeningsData);
-      setStats(statsData);
-      setMetrics(metricsData);
-      setLoading(false);
-    } catch (error) {
-      console.error('Error loading data:', error);
-      setLoading(false);
-    }
-  };
-
-  if (loading) return <div className="loading">Loading dashboard...</div>;
-
-  const chartData = [
-    { name: 'High Risk', value: stats?.highRisk || 0 },
-    { name: 'Low Risk', value: stats?.lowRisk || 0 }
-  ];
+  // Screenings per hour chart data
+  const hourCounts = {};
+  ecsScreenings.forEach(s => {
+    const hour = new Date(s.timestamp).getHours();
+    hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+  });
 
   return (
     <div className="dashboard">
-      <h1>BharatVani Live Dashboard</h1>
-      
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: '1rem' }}>
+        <h1 style={{ flex: 1 }}>BharatVani Live Dashboard</h1>
+        <span style={{ fontWeight: 'bold', color: connectionStatus === 'connected' ? '#2e7d32' : connectionStatus === 'reconnecting' ? '#ff9800' : '#c62828' }}>
+          {connectionStatus === 'connected' && 'Connected to ECS'}
+          {connectionStatus === 'reconnecting' && 'Reconnecting...'}
+          {connectionStatus === 'disconnected' && 'Disconnected'}
+        </span>
+        <button
+          className="ml-4 px-4 py-2 bg-blue-600 text-white rounded-xl shadow hover:bg-blue-700"
+          onClick={() => window.location.href = '/ivr-simulation'}
+        >
+          Start IVR Simulation
+        </button>
+      </div>
+
       <div className="stats-grid">
         <div className="stat-card">
           <h3>Total Screenings</h3>
-          <p className="stat-value">{stats?.total || 0}</p>
+          <p className="stat-value">{ecsMetrics.total}</p>
         </div>
         <div className="stat-card">
           <h3>High Risk</h3>
-          <p className="stat-value risk-high">{stats?.highRisk || 0}</p>
+          <p className="stat-value risk-high">{ecsMetrics.highRisk}</p>
         </div>
         <div className="stat-card">
           <h3>Avg Confidence</h3>
-          <p className="stat-value">{stats?.avgConfidence || 0}%</p>
-        </div>
-        <div className="stat-card">
-          <h3>Lambda Invocations</h3>
-          <p className="stat-value">{metrics?.invocations || 0}</p>
+          <p className="stat-value">{ecsMetrics.avgConfidence}%</p>
         </div>
       </div>
 
       <div className="chart-container">
         <h2>Risk Distribution</h2>
-        <ResponsiveContainer width="100%" height={300}>
-          <BarChart data={chartData}>
-            <XAxis dataKey="name" />
-            <YAxis />
-            <Tooltip />
-            <Bar dataKey="value" fill="#FF9900" />
-          </BarChart>
-        </ResponsiveContainer>
+        <div style={{ display: 'flex', gap: '1rem' }}>
+          {Object.entries(riskCounts).map(([risk, count]) => (
+            <div key={risk}>{risk}: {count}</div>
+          ))}
+        </div>
+      </div>
+
+      <div className="chart-container">
+        <h2>Screenings per Hour</h2>
+        <div style={{ display: 'flex', gap: '1rem' }}>
+          {Object.entries(hourCounts).map(([hour, count]) => (
+            <div key={hour}>{hour}:00 - {count}</div>
+          ))}
+        </div>
       </div>
 
       <div className="screenings-table">
@@ -82,18 +75,22 @@ export default function Dashboard() {
             <tr>
               <th>ID</th>
               <th>Phone</th>
-              <th>Risk Level</th>
+              <th>Audio Risk</th>
+              <th>Symptom Risk</th>
+              <th>Combined Risk</th>
               <th>Confidence</th>
               <th>Timestamp</th>
             </tr>
           </thead>
           <tbody>
-            {screenings.map(s => (
-              <tr key={s.screeningId}>
-                <td>{s.screeningId?.substring(0, 8)}</td>
-                <td>{s.phoneNumber}</td>
-                <td className={`risk-${s.riskLevel?.toLowerCase()}`}>{s.riskLevel}</td>
-                <td>{s.confidence}%</td>
+            {ecsScreenings.map(s => (
+              <tr key={s.screening_id}>
+                <td>{s.screening_id}</td>
+                <td>{s.phone}</td>
+                <td>{s.audio_risk}</td>
+                <td>{s.symptom_risk}</td>
+                <td>{s.combined_risk}</td>
+                <td>{s.confidence}</td>
                 <td>{new Date(s.timestamp).toLocaleString()}</td>
               </tr>
             ))}
