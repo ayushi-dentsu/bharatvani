@@ -1,0 +1,4 @@
+websockets>=12.0
+boto3
+aws-sdk-bedrock-runtime
+smithy-aws-core

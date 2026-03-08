@@ -1,37 +1,26 @@
-#!/usr/bin/env python3
 """
-Nova 2 Sonic – Multilingual Health Intake Voice Agent
-=====================================================
-Single-file terminal app using AWS Bedrock Nova 2 Sonic bidirectional streaming.
-Deterministic state-machine controls the conversation (no free-form dialogue).
-
-Dependencies:
-    pip install pyaudio boto3 aws-sdk-bedrock-runtime smithy-aws-core
-
-Run:
-    python nova_sonic_health_intake_agent.py --s3-bucket my-bucket
-    python nova_sonic_health_intake_agent.py --s3-bucket my-bucket --voice-id arjun --debug-events
-    python nova_sonic_health_intake_agent.py --list-audio-devices
+Nova Sonic Health Intake Agent — AWS Lambda (WebSocket)
+=======================================================
+Single Lambda function behind API Gateway v2 WebSocket API.
+Handles $connect, $disconnect, $default routes. Reuses the same
+state machine, answer parsers, and Bedrock streaming logic from
+the terminal agent, replacing PyAudio I/O with WebSocket messages.
 """
 
-import argparse
 import asyncio
 import base64
 import json
-import math
 import os
 import struct
-import sys
-import time
+import math
 import uuid
-import wave
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Optional
 
 import boto3
-import pyaudio
 from aws_sdk_bedrock_runtime.client import (
     BedrockRuntimeClient,
     InvokeModelWithBidirectionalStreamOperationInput,
@@ -44,19 +33,22 @@ from aws_sdk_bedrock_runtime.models import (
 from smithy_aws_core.identity.environment import EnvironmentCredentialsResolver
 from smithy_aws_core.auth.sigv4 import SigV4AuthScheme
 
-# ─── Audio constants ────────────────────────────────────────────────────────────
+# ─── Environment ─────────────────────────────────────────────────────────────
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+VOICE_ID = os.environ.get("VOICE_ID", "arjun")
+
+# ─── Audio constants ─────────────────────────────────────────────────────────
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
-CHANNELS = 1
-FORMAT = pyaudio.paInt16
-CHUNK_SIZE = 1024
 
-# ─── Intake field definitions ───────────────────────────────────────────────────
+# ─── Intake field definitions ────────────────────────────────────────────────
 SYMPTOM_FIELDS = ["fever", "cold", "cough", "fatigue", "loss_of_smell", "breathing_difficulties"]
 HISTORY_FIELDS = ["asthma", "diabetes", "hypertension", "smoker"]
 ALL_BINARY_FIELDS = SYMPTOM_FIELDS + HISTORY_FIELDS
 
-# ─── State machine ──────────────────────────────────────────────────────────────
+# ─── State machine ───────────────────────────────────────────────────────────
 class State(Enum):
     LANGUAGE_SELECT = auto()
     ASKING = auto()
@@ -65,37 +57,7 @@ class State(Enum):
     DONE = auto()
 
 
-# ─── Logging ─────────────────────────────────────────────────────────────────────
-DEBUG_EVENTS = False
-DEBUG_AUDIO = False
-
-def ts() -> str:
-    """Timestamped prefix for log lines."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
-def log_event(msg: str) -> None:
-    if DEBUG_EVENTS:
-        print(f"[{ts()}] [EVENT] {msg}")
-
-def log_audio(msg: str) -> None:
-    if DEBUG_AUDIO:
-        print(f"[{ts()}] [AUDIO] {msg}")
-
-def log_info(msg: str) -> None:
-    print(f"[{ts()}] {msg}")
-
-
-# ─── Utility ─────────────────────────────────────────────────────────────────────
-def pcm16_rms(data: bytes) -> float:
-    """Compute RMS of 16-bit PCM data."""
-    n = len(data) // 2
-    if n == 0:
-        return 0.0
-    samples = struct.unpack(f"<{n}h", data[:n * 2])
-    return math.sqrt(sum(s * s for s in samples) / n)
-
-
-# ─── Questions definition ────────────────────────────────────────────────────────
+# ─── Questions definition ────────────────────────────────────────────────────
 @dataclass
 class IntakeQuestion:
     key: str                    # field name in output
@@ -125,8 +87,7 @@ INTAKE_QUESTIONS: list[IntakeQuestion] = [
     IntakeQuestion("smoker",       "Are you a smoker? Yes or No.", "क्या आप धूम्रपान करते हैं? हाँ या नहीं।", "binary"),
 ]
 
-
-# ─── Answer parsing helpers ──────────────────────────────────────────────────────
+# ─── Answer parsing helpers ──────────────────────────────────────────────────
 YES_WORDS = {
     "yes", "yeah", "yep", "yup", "sure", "correct", "right", "affirmative",
     "हाँ", "हां", "जी", "जी हाँ", "ha", "haan", "ji",
@@ -174,7 +135,6 @@ def parse_binary(text: str) -> Optional[int]:
 
 def parse_age(text: str) -> Optional[int]:
     """Extract first integer from text as age. Handles Hindi numerals too."""
-    # Map Hindi/Devanagari digits to ASCII
     hindi_digit_map = str.maketrans("०१२३४५६७८९", "0123456789")
     t = text.translate(hindi_digit_map)
     digits = "".join(ch if ch.isdigit() else " " for ch in t)
@@ -209,7 +169,6 @@ def parse_age(text: str) -> Optional[int]:
 def parse_gender(text: str) -> str:
     """Map text to M/F/O, default U. Checks female before male to avoid substring match."""
     t = text.strip().lower()
-    # Single-letter shortcut
     if t in ("m", "f", "o"):
         return t.upper()
     for key, val in GENDER_MAP_ORDERED:
@@ -232,44 +191,33 @@ def detect_language_choice(text: str) -> Optional[str]:
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Nova Sonic Bidirectional Streaming Client
-# ═══════════════════════════════════════════════════════════════════════════════
-class NovaSonicClient:
+# ─── BedrockStreamManager ────────────────────────────────────────────────────
+class BedrockStreamManager:
     """
-    Manages a single bidirectional streaming session with Bedrock Nova 2 Sonic.
-    Follows the reference sample's event-loop architecture:
-        sessionStart → promptStart → contentStart → audioInput/textInput →
-        contentEnd → promptEnd → sessionEnd
+    Manages a single bidirectional streaming session with Bedrock Nova Sonic.
+    Ported from NovaSonicClient — replaces PyAudio I/O with WebSocket delivery
+    via API Gateway Management API.
     """
 
-    def __init__(
-        self,
-        model_id: str,
-        region: str,
-        voice_id: str,
-        input_device_index: Optional[int] = None,
-        output_device_index: Optional[int] = None,
-    ):
+    def __init__(self, model_id: str, region: str, voice_id: str,
+                 apigw_client, connection_id: str):
         self.model_id = model_id
         self.region = region
         self.voice_id = voice_id
-        self.input_device_index = input_device_index
-        self.output_device_index = output_device_index
+        self.apigw_client = apigw_client
+        self.connection_id = connection_id
 
         self.bedrock_client: Optional[BedrockRuntimeClient] = None
         self.stream = None
         self.is_active = False
 
         # Asyncio primitives
-        self._send_lock = asyncio.Lock()  # serialize all sends to avoid race conditions
+        self._send_lock = asyncio.Lock()
         self.audio_input_queue: asyncio.Queue = asyncio.Queue()
-        self.audio_output_queue: asyncio.Queue = asyncio.Queue()
 
         # Tasks
         self._response_task: Optional[asyncio.Task] = None
         self._audio_send_task: Optional[asyncio.Task] = None
-        self._playback_task: Optional[asyncio.Task] = None
 
         # Session identifiers
         self.prompt_name: str = ""
@@ -278,17 +226,12 @@ class NovaSonicClient:
         # Transcript collection
         self.user_text_parts: list[str] = []
         self.assistant_text_parts: list[str] = []
-        self._last_assistant_text: str = ""  # for dedup
+        self._last_assistant_text: str = ""
         self.barge_in = False
-        self._mute_mic = False  # suppress mic input during model speech
-        self._assistant_speaking = False  # true while model is producing audio
-        self._assistant_audio_is_active = False  # true during AUDIO content block
-        self._audio_played_for_turn = False  # true after first assistant audio plays in a turn
-
-        # PyAudio handles
-        self._pa: Optional[pyaudio.PyAudio] = None
-        self._input_stream = None
-        self._output_stream = None
+        self._mute_mic = False
+        self._assistant_speaking = False
+        self._assistant_audio_is_active = False
+        self._audio_played_for_turn = False
 
     # ── Client init ──────────────────────────────────────────────────────────
     def _init_bedrock(self) -> None:
@@ -310,17 +253,15 @@ class NovaSonicClient:
             try:
                 await self.stream.input_stream.send(chunk)
             except Exception as e:
-                log_event(f"Send error: {e}")
+                log_info(f"Send error: {e}")
                 raise
-        # Log non-audio events
         event_keys = list(payload.get("event", {}).keys())
         if "audioInput" not in event_keys and event_keys:
-            log_event(f"SENT → {event_keys}")
-
+            log_info(f"SENT → {event_keys}")
 
     # ── Session lifecycle ────────────────────────────────────────────────────
     async def open_session(self, system_prompt: str) -> None:
-        """Open stream, send sessionStart + promptStart + system text, start audio I/O."""
+        """Open stream, send sessionStart + promptStart + system text, start loops."""
         if not self.bedrock_client:
             self._init_bedrock()
 
@@ -339,12 +280,7 @@ class NovaSonicClient:
         self._assistant_audio_is_active = False
         self._audio_played_for_turn = False
 
-        # Flush stale data from queues (e.g. None sentinel from previous close)
-        while not self.audio_output_queue.empty():
-            try:
-                self.audio_output_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        # Flush stale data from queue
         while not self.audio_input_queue.empty():
             try:
                 self.audio_input_queue.get_nowait()
@@ -415,7 +351,7 @@ class NovaSonicClient:
             }
         })
 
-        # 4) Open audio input content (stays open for mic streaming)
+        # 4) Open audio input content (stays open for streaming)
         await self._send_event({
             "event": {
                 "contentStart": {
@@ -436,21 +372,17 @@ class NovaSonicClient:
             }
         })
 
-        # Start background tasks
+        # Start background tasks (no PyAudio — audio comes from WebSocket)
         self._response_task = asyncio.create_task(self._response_loop())
         self._audio_send_task = asyncio.create_task(self._audio_send_loop())
-        self._start_audio_io()
 
-        log_info("Session opened")
+        log_info("Bedrock session opened")
 
     async def close_session(self) -> None:
         """Cleanly tear down: contentEnd → promptEnd → sessionEnd → close."""
         if not self.is_active:
             return
         self.is_active = False
-
-        # Stop mic input stream first
-        self._stop_audio_input()
 
         # Close audio content
         try:
@@ -485,30 +417,22 @@ class NovaSonicClient:
         except Exception:
             pass
 
-        # Brief pause to let CRT futures settle (avoids InvalidStateError noise)
+        # Brief pause to let CRT futures settle
         await asyncio.sleep(0.3)
 
-        # Signal playback to stop
-        await self.audio_output_queue.put(None)
-
         # Cancel tasks
-        for task in [self._response_task, self._audio_send_task, self._playback_task]:
+        for task in [self._response_task, self._audio_send_task]:
             if task and not task.done():
                 task.cancel()
-        tasks = [t for t in [self._response_task, self._audio_send_task, self._playback_task] if t]
+        tasks = [t for t in [self._response_task, self._audio_send_task] if t]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Cleanup PyAudio output
-        self._stop_audio_output()
-
-        log_info("Session closed")
-
+        log_info("Bedrock session closed")
 
     # ── Send text instruction to model ───────────────────────────────────────
     async def send_text(self, text: str, role: str = "USER") -> None:
-        """Send a text content block (USER or SYSTEM) within the current prompt."""
-        # Reset turn flag — new instruction = allow audio again
+        """Send a text content block within the current prompt."""
         self._audio_played_for_turn = False
         self._assistant_audio_is_active = False
         cn = str(uuid.uuid4())
@@ -541,11 +465,11 @@ class NovaSonicClient:
                 }
             }
         })
-        log_event(f"Sent text ({role}): {text[:80]}...")
+        log_info(f"Sent text ({role}): {text[:80]}...")
 
     # ── Response processing loop ─────────────────────────────────────────────
     async def _response_loop(self) -> None:
-        """Read events from the Bedrock stream and dispatch."""
+        """Read events from Bedrock stream, send audio/transcript to client via WebSocket."""
         try:
             while self.is_active:
                 try:
@@ -564,7 +488,7 @@ class NovaSonicClient:
                             self._assistant_speaking = True
                             if ctype == "AUDIO":
                                 self._assistant_audio_is_active = True
-                        log_event(f"contentStart role={role} type={ctype}")
+                        log_info(f"contentStart role={role} type={ctype}")
 
                     elif "textOutput" in event:
                         to = event["textOutput"]
@@ -574,36 +498,46 @@ class NovaSonicClient:
                         # Barge-in detection
                         if '{ "interrupted" : true }' in text:
                             self.barge_in = True
-                            log_event("Barge-in detected")
+                            log_info("Barge-in detected")
                             continue
 
                         if role == "ASSISTANT" and text.strip():
-                            # Deduplicate repeated outputs
                             if text.strip() != self._last_assistant_text:
                                 self._last_assistant_text = text.strip()
                                 self.assistant_text_parts.append(text.strip())
-                                print(f"  🤖 {text.strip()}")
+                                # Send transcript to client
+                                _send_to_client(self.apigw_client, self.connection_id, {
+                                    "type": "transcript",
+                                    "role": "assistant",
+                                    "text": text.strip(),
+                                })
                         elif role == "USER" and text.strip():
                             self.user_text_parts.append(text.strip())
-                            print(f"  🎤 {text.strip()}")
+                            # Send user transcript to client
+                            _send_to_client(self.apigw_client, self.connection_id, {
+                                "type": "transcript",
+                                "role": "user",
+                                "text": text.strip(),
+                            })
 
                     elif "audioOutput" in event:
                         audio_b64 = event["audioOutput"].get("content")
                         if audio_b64:
-                            audio_bytes = base64.b64decode(audio_b64)
                             if self._audio_played_for_turn:
-                                log_audio(f"audioOutput SUPPRESSED (repeat) bytes={len(audio_bytes)}")
+                                log_info("audioOutput SUPPRESSED (repeat)")
                             else:
-                                log_audio(f"audioOutput bytes={len(audio_bytes)}")
-                                await self.audio_output_queue.put(audio_bytes)
+                                # Send audio directly to client via WebSocket
+                                _send_to_client(self.apigw_client, self.connection_id, {
+                                    "type": "audio",
+                                    "data": audio_b64,
+                                })
 
                     elif "contentEnd" in event:
-                        # Only mark turn as played when AUDIO content ends, not TEXT
                         if self._assistant_audio_is_active:
                             self._audio_played_for_turn = True
                             self._assistant_audio_is_active = False
                         self._assistant_speaking = False
-                        log_event(f"contentEnd (audio_played={self._audio_played_for_turn})")
+                        log_info(f"contentEnd (audio_played={self._audio_played_for_turn})")
 
                     elif "error" in event:
                         log_info(f"Stream error: {event['error']}")
@@ -625,7 +559,8 @@ class NovaSonicClient:
 
     # ── Audio send loop ──────────────────────────────────────────────────────
     async def _audio_send_loop(self) -> None:
-        """Drain audio_input_queue and send audioInput events to Bedrock."""
+        """Drain audio_input_queue and send audioInput events to Bedrock.
+        When _mute_mic is True, send silence to keep the stream alive."""
         try:
             while self.is_active:
                 try:
@@ -633,9 +568,25 @@ class NovaSonicClient:
                         self.audio_input_queue.get(), timeout=0.1
                     )
                 except asyncio.TimeoutError:
+                    # When muted, send silence to keep stream alive
+                    if self._mute_mic:
+                        silence = b"\x00" * 1024
+                        blob = base64.b64encode(silence).decode("utf-8")
+                        await self._send_event({
+                            "event": {
+                                "audioInput": {
+                                    "promptName": self.prompt_name,
+                                    "contentName": self.audio_content_name,
+                                    "content": blob,
+                                }
+                            }
+                        })
                     continue
                 if audio_bytes is None:
                     break
+                # When muted, replace real audio with silence
+                if self._mute_mic:
+                    audio_bytes = b"\x00" * len(audio_bytes)
                 blob = base64.b64encode(audio_bytes).decode("utf-8")
                 await self._send_event({
                     "event": {
@@ -649,101 +600,7 @@ class NovaSonicClient:
         except asyncio.CancelledError:
             pass
 
-    # ── PyAudio I/O ──────────────────────────────────────────────────────────
-    def _start_audio_io(self) -> None:
-        """Open mic input (callback-based) and speaker output streams."""
-        self._pa = pyaudio.PyAudio()
-
-        # Mic input with callback
-        kwargs: dict[str, Any] = dict(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=INPUT_SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE,
-            stream_callback=self._mic_callback,
-        )
-        if self.input_device_index is not None:
-            kwargs["input_device_index"] = self.input_device_index
-        self._input_stream = self._pa.open(**kwargs)
-
-        # Speaker output (blocking write, driven from playback task)
-        out_kwargs: dict[str, Any] = dict(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=OUTPUT_SAMPLE_RATE,
-            output=True,
-            frames_per_buffer=CHUNK_SIZE,
-        )
-        if self.output_device_index is not None:
-            out_kwargs["output_device_index"] = self.output_device_index
-        self._output_stream = self._pa.open(**out_kwargs)
-
-        # Start playback task
-        self._playback_task = asyncio.create_task(self._playback_loop())
-
-    def _mic_callback(self, in_data, frame_count, time_info, status):
-        """PyAudio callback – always send audio to keep the stream alive.
-        Send silence when muted to prevent model re-triggering."""
-        if self.is_active:
-            if self._mute_mic:
-                # Send silence — stream must stay fed or model re-speaks
-                in_data = b"\x00" * len(in_data)
-            try:
-                self.audio_input_queue.put_nowait(in_data)
-            except Exception:
-                pass
-        return (None, pyaudio.paContinue)
-
-    def _stop_audio_input(self) -> None:
-        if self._input_stream:
-            try:
-                if self._input_stream.is_active():
-                    self._input_stream.stop_stream()
-                self._input_stream.close()
-            except Exception:
-                pass
-            self._input_stream = None
-
-    def _stop_audio_output(self) -> None:
-        if self._output_stream:
-            try:
-                if self._output_stream.is_active():
-                    self._output_stream.stop_stream()
-                self._output_stream.close()
-            except Exception:
-                pass
-            self._output_stream = None
-        if self._pa:
-            try:
-                self._pa.terminate()
-            except Exception:
-                pass
-            self._pa = None
-
-    async def _playback_loop(self) -> None:
-        """Read from audio_output_queue and write to speaker."""
-        loop = asyncio.get_event_loop()
-        try:
-            while True:
-                data = await self.audio_output_queue.get()
-                if data is None:
-                    break
-                # Handle barge-in: flush queue
-                if self.barge_in:
-                    while not self.audio_output_queue.empty():
-                        try:
-                            self.audio_output_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                    self.barge_in = False
-                    continue
-                if self._output_stream and not self._output_stream.is_stopped():
-                    await loop.run_in_executor(None, self._output_stream.write, data)
-        except asyncio.CancelledError:
-            pass
-
-
+    # ── High-level helpers ───────────────────────────────────────────────────
     def get_all_assistant_text(self) -> str:
         """Return all assistant text since last clear."""
         text = " ".join(self.assistant_text_parts)
@@ -751,25 +608,22 @@ class NovaSonicClient:
         return text
 
     async def instruct_and_wait_for_speech(self, instruction: str, wait_s: float = 10.0) -> None:
-        """Send a text instruction and wait for the first audio block to finish playing."""
+        """Send a text instruction and wait for the assistant audio to finish.
+        No playback queue drain needed — audio goes directly to client via WebSocket."""
         self.assistant_text_parts.clear()
         self.user_text_parts.clear()
         await self.send_text(instruction)
-        # Wait for _audio_played_for_turn then queue drain
         deadline = asyncio.get_event_loop().time() + wait_s
         while asyncio.get_event_loop().time() < deadline:
             if self._audio_played_for_turn:
-                while asyncio.get_event_loop().time() < deadline:
-                    if self.audio_output_queue.empty():
-                        await asyncio.sleep(0.15)
-                        return
-                    await asyncio.sleep(0.05)
+                # Small buffer to let final audio chunk reach client
+                await asyncio.sleep(0.15)
                 return
             await asyncio.sleep(0.05)
 
     async def wait_for_user_response(self, timeout_s: float = 10.0, settle_s: float = 1.0,
-                                       quick_answers: bool = False) -> str:
-        """Wait for user speech, with settle time after last transcript update.
+                                     quick_answers: bool = False) -> str:
+        """Wait for user speech with settle time after last transcript update.
         If quick_answers=True, return immediately on clear yes/no/skip."""
         self.user_text_parts.clear()
         deadline = asyncio.get_event_loop().time() + timeout_s
@@ -782,14 +636,13 @@ class NovaSonicClient:
                 latest = self.user_text_parts[-1]
                 last_update = asyncio.get_event_loop().time()
 
-                # Fast path: if we got a clear short answer, return immediately
+                # Fast path for clear short answers
                 if quick_answers and latest.strip():
                     low = latest.strip().lower()
-                    # Check if it's a recognizable quick answer
                     quick_words = YES_WORDS | NO_WORDS | SKIP_WORDS
                     tokens = set(low.split())
                     if tokens & quick_words or low in quick_words:
-                        await asyncio.sleep(0.2)  # tiny buffer
+                        await asyncio.sleep(0.2)
                         self.user_text_parts.clear()
                         return latest
 
@@ -801,20 +654,26 @@ class NovaSonicClient:
         return latest
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  S3 Integration
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Logging ─────────────────────────────────────────────────────────────────
+def ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+def log_info(msg: str) -> None:
+    print(f"[{ts()}] {msg}")
+
+
+# ─── S3 Uploader ─────────────────────────────────────────────────────────────
 class S3Uploader:
-    """Pluggable S3 upload functions for cough WAV and final JSON."""
+    """Upload cough WAV and final JSON to S3."""
 
     def __init__(self, bucket: str, region: str):
         self.bucket = bucket
         self.s3 = boto3.client("s3", region_name=region)
 
-    def upload_cough_wav(self, local_path: str) -> str:
-        """Upload cough WAV file, return s3:// URI."""
+    def upload_cough_wav(self, wav_bytes: bytes) -> str:
+        """Upload cough WAV bytes, return s3:// URI."""
         key = f"health-intake/cough/{uuid.uuid4()}.wav"
-        self.s3.upload_file(local_path, self.bucket, key)
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=wav_bytes, ContentType="audio/wav")
         uri = f"s3://{self.bucket}/{key}"
         log_info(f"Cough WAV uploaded → {uri}")
         return uri
@@ -829,128 +688,13 @@ class S3Uploader:
         return uri
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Cough Recording (offline, after Nova session ends)
-# ═══════════════════════════════════════════════════════════════════════════════
-def play_beep(duration_ms: int = 300, freq: int = 880, device_index: Optional[int] = None) -> None:
-    """Play an audible beep tone through the speaker."""
-    p = pyaudio.PyAudio()
-    sample_rate = 24000
-    n_samples = int(sample_rate * duration_ms / 1000)
-    # Generate sine wave
-    import array
-    buf = array.array("h", [0] * n_samples)
-    for i in range(n_samples):
-        val = int(16000 * math.sin(2 * math.pi * freq * i / sample_rate))
-        buf[i] = max(-32768, min(32767, val))
-    raw = buf.tobytes()
-
-    kwargs: dict[str, Any] = dict(
-        format=FORMAT, channels=1, rate=sample_rate, output=True,
-    )
-    if device_index is not None:
-        kwargs["output_device_index"] = device_index
-    stream = p.open(**kwargs)
-    try:
-        stream.write(raw)
-    finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-
-
-def record_cough_wav(
-    out_path: str,
-    seconds: int = 8,
-    input_device_index: Optional[int] = None,
-    output_device_index: Optional[int] = None,
-) -> tuple[bool, int]:
+# ─── ConversationManager ─────────────────────────────────────────────────────
+class ConversationManager:
     """
-    Record cough audio to WAV. Returns (valid, burst_count).
-    Validates via RMS threshold heuristic.
-    """
-    # Play audible beep
-    play_beep(duration_ms=400, freq=880, device_index=output_device_index)
-    time.sleep(0.2)
-
-    p = pyaudio.PyAudio()
-    kwargs: dict[str, Any] = dict(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=INPUT_SAMPLE_RATE,
-        input=True,
-        frames_per_buffer=CHUNK_SIZE,
-    )
-    if input_device_index is not None:
-        kwargs["input_device_index"] = input_device_index
-
-    stream = None
-    try:
-        stream = p.open(**kwargs)
-        frames: list[bytes] = []
-        rms_values: list[float] = []
-
-        log_info(f"Recording cough for {seconds}s... cough now!")
-
-        total_chunks = int(INPUT_SAMPLE_RATE / CHUNK_SIZE * seconds)
-        for _ in range(total_chunks):
-            data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-            frames.append(data)
-            rms_values.append(pcm16_rms(data))
-
-        # Write WAV
-        with wave.open(out_path, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(INPUT_SAMPLE_RATE)
-            wf.writeframes(b"".join(frames))
-
-        log_info(f"Cough WAV saved: {out_path}")
-
-        # Validate cough bursts
-        valid, count = _validate_cough_bursts(rms_values)
-        log_info(f"Cough validation: valid={valid}, bursts={count}")
-        return valid, count
-
-    finally:
-        if stream:
-            stream.stop_stream()
-            stream.close()
-        p.terminate()
-
-
-def _validate_cough_bursts(rms_values: list[float]) -> tuple[bool, int]:
-    """Heuristic: count RMS spikes above threshold as cough bursts."""
-    if not rms_values:
-        return False, 0
-    peak = max(rms_values)
-    median = sorted(rms_values)[len(rms_values) // 2]
-    threshold = max(800.0, median * 2.5, peak * 0.4)
-
-    count = 0
-    cooldown = 0
-    for v in rms_values:
-        if cooldown > 0:
-            cooldown -= 1
-            continue
-        if v >= threshold:
-            count += 1
-            cooldown = 8  # ~0.5s at 16kHz/1024 chunk
-
-    return count >= 3, count
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Health Intake Agent – Deterministic State Machine
-# ═══════════════════════════════════════════════════════════════════════════════
-class HealthIntakeAgent:
-    """
-    App-controlled turn-taking state machine.
+    App-controlled turn-taking state machine (ported from HealthIntakeAgent).
     States: LANGUAGE_SELECT → ASKING → WAITING_USER → COUGH_PHASE → DONE
-    Asks exactly one question at a time, waits for one answer, then advances.
     """
 
-    # System prompt keeps the model tightly constrained
     SYSTEM_PROMPT = (
         "You are a multilingual health intake voice assistant. "
         "STRICT RULES: "
@@ -963,77 +707,59 @@ class HealthIntakeAgent:
         "7. When asked to reply with only a number or word, do exactly that."
     )
 
-    MAX_RETRIES = 2  # retries per question on timeout/no-input
+    MAX_RETRIES = 2
+    COUGH_DURATION = 8
 
-    def __init__(self, args: argparse.Namespace):
-        self.args = args
+    def __init__(self, connection_id: str, apigw_client):
+        self.connection_id = connection_id
+        self.apigw_client = apigw_client
+
         self.state = State.LANGUAGE_SELECT
-        self.language: str = "English"  # default
+        self.language: str = "English"
         self.question_index: int = 0
-        self.answers: dict[str, Any] = {}  # collected answers keyed by field name
+        self.answers: dict[str, Any] = {}
         self.cough_s3_uri: str = ""
 
-        self.nova = NovaSonicClient(
-            model_id=args.model_id,
-            region=args.region,
-            voice_id=args.voice_id,
-            input_device_index=args.input_device_index,
-            output_device_index=args.output_device_index,
+        # Cough audio future — set when client sends cough_audio message
+        self._cough_future: Optional[asyncio.Future] = None
+
+        self.nova = BedrockStreamManager(
+            model_id=BEDROCK_MODEL_ID,
+            region=AWS_REGION,
+            voice_id=VOICE_ID,
+            apigw_client=apigw_client,
+            connection_id=connection_id,
         )
-        self.s3_uploader = S3Uploader(bucket=args.s3_bucket, region=args.region)
+        self.s3_uploader = S3Uploader(bucket=S3_BUCKET, region=AWS_REGION)
 
-    # ── Build the final output JSON ──────────────────────────────────────────
-    def _build_output(self) -> dict:
-        """
-        Build the exact output shape required:
-        {"body": "{\"age\":50,\"gender\":\"M\",...}"}
-        """
-        body: dict[str, Any] = {}
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def _send_to_client(self, message: dict) -> None:
+        """Send a JSON message to the connected WebSocket client."""
+        try:
+            self.apigw_client.post_to_connection(
+                ConnectionId=self.connection_id,
+                Data=json.dumps(message).encode("utf-8"),
+            )
+        except Exception as e:
+            log_info(f"Failed to send to {self.connection_id}: {e}")
 
-        # Name
-        body["name"] = self.answers.get("name", "")
-
-        # Age
-        age = self.answers.get("age")
-        body["age"] = age if isinstance(age, int) else 0
-
-        # Gender
-        body["gender"] = self.answers.get("gender", "U")
-
-        # Binary fields: strict 0/1
-        for f in ALL_BINARY_FIELDS:
-            val = self.answers.get(f)
-            if val is None:
-                body[f] = 0  # unknown → safe default
-            else:
-                body[f] = int(val) if isinstance(val, int) else 0
-
-        # Cough S3 URI (extra, outside body string but useful)
-        body_json_str = json.dumps(body, ensure_ascii=False)
-        output = {"body": body_json_str}
-
-        if self.cough_s3_uri:
-            output["cough_audio_s3"] = self.cough_s3_uri
-
-        return output
+    def _send_state_update(self, question: Optional[str] = None) -> None:
+        """Notify client of current state and active question."""
+        self._send_to_client({
+            "type": "state",
+            "state": self.state.name,
+            "question": question,
+        })
 
     async def _wait_until_assistant_done(self, timeout_s: float = 10.0) -> None:
-        """Wait until the first assistant AUDIO content block finishes."""
+        """Wait until the first assistant audio content block finishes."""
         deadline = asyncio.get_event_loop().time() + timeout_s
-
-        # Wait for the first audio block to start and finish
         while asyncio.get_event_loop().time() < deadline:
             if self.nova._audio_played_for_turn:
-                # First audio block is done — wait for playback queue to drain
-                while asyncio.get_event_loop().time() < deadline:
-                    if self.nova.audio_output_queue.empty():
-                        await asyncio.sleep(0.15)
-                        return
-                    await asyncio.sleep(0.05)
+                await asyncio.sleep(0.15)
                 return
             await asyncio.sleep(0.05)
 
-    # ── Speak a sentence via Nova ────────────────────────────────────────────
     async def _speak(self, english_text: str, hindi_text: str) -> None:
         """Instruct Nova to speak the appropriate language version."""
         if self.language == "Hindi":
@@ -1044,115 +770,10 @@ class HealthIntakeAgent:
         await self.nova.instruct_and_wait_for_speech(instruction, wait_s=8.0)
         self.nova._mute_mic = False
 
-    # ── Ask one question and get answer ──────────────────────────────────────
-    async def _ask_one(self, q: IntakeQuestion) -> Optional[Any]:
-        """
-        Ask a single question, wait for user response.
-        Returns parsed value or None (skip/timeout).
-        Retries up to MAX_RETRIES on no-input.
-        """
-        for attempt in range(self.MAX_RETRIES + 1):
-            self.state = State.ASKING
-
-            # Instruct model to ask the question
-            if self.language == "Hindi":
-                instruction = f"Speak in Hindi. Ask exactly: {q.hindi}"
-            else:
-                instruction = f"Speak in English. Ask exactly: {q.english}"
-
-            self.nova.assistant_text_parts.clear()
-            self.nova.user_text_parts.clear()
-
-            # Mute mic while model speaks to prevent echo triggering repeats
-            self.nova._mute_mic = True
-            await self.nova.send_text(instruction)
-
-            # Wait until assistant finishes speaking (or timeout)
-            await self._wait_until_assistant_done(timeout_s=10.0)
-
-            # Now unmute and listen for user response
-            self.nova.user_text_parts.clear()  # discard anything picked up during mute
-            self.nova._mute_mic = False
-            self.state = State.WAITING_USER
-
-            # Use fast path for binary questions, normal settle for text/age/gender
-            is_quick = q.field_type == "binary"
-            user_text = await self.nova.wait_for_user_response(
-                timeout_s=10.0,
-                settle_s=0.3 if is_quick else 0.5,
-                quick_answers=is_quick,
-            )
-
-            if not user_text.strip():
-                if attempt < self.MAX_RETRIES:
-                    log_info(f"No response for '{q.key}', retrying ({attempt + 1}/{self.MAX_RETRIES})...")
-                    continue
-                else:
-                    log_info(f"No response for '{q.key}' after retries, using default.")
-                    return None
-
-            # Check skip
-            if is_skip(user_text):
-                log_info(f"User skipped '{q.key}'")
-                return None
-
-            # Parse based on field type
-            if q.field_type == "binary":
-                val = parse_binary(user_text)
-                if val is not None:
-                    return val
-                # Unclear answer – use model to interpret
-                val = await self._model_interpret_binary(user_text)
-                return val
-
-            elif q.field_type == "age":
-                val = parse_age(user_text)
-                if val is not None:
-                    return val
-                # Try model interpretation
-                return await self._model_interpret_age(user_text)
-
-            elif q.field_type == "gender":
-                return parse_gender(user_text)
-
-            else:  # text
-                return user_text.strip()
-
-        return None
-
-    async def _model_interpret_binary(self, text: str) -> Optional[int]:
-        """Ask the model to interpret an ambiguous yes/no answer."""
-        instruction = (
-            f"The user was asked a yes/no health question and answered: \"{text}\". "
-            "Reply with ONLY the word 'yes' or 'no'. Nothing else."
-        )
-        self.nova._mute_mic = True
-        await self.nova.send_text(instruction)
-        await self._wait_until_assistant_done(timeout_s=5.0)
-        self.nova._mute_mic = False
-        response = self.nova.get_all_assistant_text().strip().lower()
-        if "yes" in response:
-            return 1
-        if "no" in response:
-            return 0
-        return None
-
-    async def _model_interpret_age(self, text: str) -> Optional[int]:
-        """Ask the model to extract age from ambiguous text."""
-        instruction = (
-            f"The user said: \"{text}\". Extract the age as a number. "
-            "Respond with ONLY the number, nothing else. No words, no explanation."
-        )
-        self.nova._mute_mic = True
-        await self.nova.send_text(instruction)
-        await self._wait_until_assistant_done(timeout_s=5.0)
-        self.nova._mute_mic = False
-        response = self.nova.get_all_assistant_text().strip()
-        return parse_age(response)
-
-    # ── Language selection phase ──────────────────────────────────────────────
+    # ── Language selection (3.2) ─────────────────────────────────────────────
     async def _select_language(self) -> None:
         """Ask user to choose English or Hindi."""
+        self._send_state_update()
         for attempt in range(self.MAX_RETRIES + 1):
             instruction = (
                 "Speak in English. Say exactly: "
@@ -1173,16 +794,15 @@ class HealthIntakeAgent:
                 if choice:
                     self.language = choice
                     log_info(f"Language selected: {self.language}")
-                    # Confirm
                     if self.language == "Hindi":
                         await self._speak(
                             "You selected Hindi. Let us begin.",
-                            "आपने हिंदी चुनी है। चलिए शुरू करते हैं।"
+                            "आपने हिंदी चुनी है। चलिए शुरू करते हैं।",
                         )
                     else:
                         await self._speak(
                             "You selected English. Let us begin.",
-                            "You selected English. Let us begin."
+                            "You selected English. Let us begin.",
                         )
                     return
 
@@ -1192,51 +812,174 @@ class HealthIntakeAgent:
                 log_info("Defaulting to English.")
                 self.language = "English"
 
-    # ── Cough phase ──────────────────────────────────────────────────────────
-    async def _cough_phase(self) -> None:
-        """Announce cough recording, close Nova session, record WAV, upload."""
-        self.state = State.COUGH_PHASE
+    # ── Ask one question (3.3) ───────────────────────────────────────────────
+    async def _ask_one(self, q: IntakeQuestion) -> Optional[Any]:
+        """Ask a single question, wait for user response, parse answer."""
+        for attempt in range(self.MAX_RETRIES + 1):
+            self.state = State.ASKING
+            self._send_state_update(question=q.key)
 
-        # Speak the cough instruction
+            if self.language == "Hindi":
+                instruction = f"Speak in Hindi. Ask exactly: {q.hindi}"
+            else:
+                instruction = f"Speak in English. Ask exactly: {q.english}"
+
+            self.nova.assistant_text_parts.clear()
+            self.nova.user_text_parts.clear()
+            self.nova._mute_mic = True
+            await self.nova.send_text(instruction)
+            await self._wait_until_assistant_done(timeout_s=10.0)
+
+            self.nova.user_text_parts.clear()
+            self.nova._mute_mic = False
+            self.state = State.WAITING_USER
+            self._send_state_update(question=q.key)
+
+            is_quick = q.field_type == "binary"
+            user_text = await self.nova.wait_for_user_response(
+                timeout_s=10.0,
+                settle_s=0.3 if is_quick else 0.5,
+                quick_answers=is_quick,
+            )
+
+            if not user_text.strip():
+                if attempt < self.MAX_RETRIES:
+                    log_info(f"No response for '{q.key}', retrying ({attempt + 1}/{self.MAX_RETRIES})...")
+                    continue
+                else:
+                    log_info(f"No response for '{q.key}' after retries, using default.")
+                    return None
+
+            if is_skip(user_text):
+                log_info(f"User skipped '{q.key}'")
+                return None
+
+            if q.field_type == "binary":
+                val = parse_binary(user_text)
+                if val is not None:
+                    return val
+                return await self._model_interpret_binary(user_text)
+
+            elif q.field_type == "age":
+                val = parse_age(user_text)
+                if val is not None:
+                    return val
+                return await self._model_interpret_age(user_text)
+
+            elif q.field_type == "gender":
+                return parse_gender(user_text)
+
+            else:  # text
+                return user_text.strip()
+
+        return None
+
+    # ── Model fallback interpreters (3.4) ────────────────────────────────────
+    async def _model_interpret_binary(self, text: str) -> Optional[int]:
+        """Ask the model to interpret an ambiguous yes/no answer."""
+        instruction = (
+            f'The user was asked a yes/no health question and answered: "{text}". '
+            "Reply with ONLY the word 'yes' or 'no'. Nothing else."
+        )
+        self.nova._mute_mic = True
+        await self.nova.send_text(instruction)
+        await self._wait_until_assistant_done(timeout_s=5.0)
+        self.nova._mute_mic = False
+        response = self.nova.get_all_assistant_text().strip().lower()
+        if "yes" in response:
+            return 1
+        if "no" in response:
+            return 0
+        return None
+
+    async def _model_interpret_age(self, text: str) -> Optional[int]:
+        """Ask the model to extract age from ambiguous text."""
+        instruction = (
+            f'The user said: "{text}". Extract the age as a number. '
+            "Respond with ONLY the number, nothing else. No words, no explanation."
+        )
+        self.nova._mute_mic = True
+        await self.nova.send_text(instruction)
+        await self._wait_until_assistant_done(timeout_s=5.0)
+        self.nova._mute_mic = False
+        response = self.nova.get_all_assistant_text().strip()
+        return parse_age(response)
+
+    # ── Build output (3.5) ───────────────────────────────────────────────────
+    def _build_output(self) -> dict:
+        """Build the final output JSON."""
+        body: dict[str, Any] = {}
+        body["name"] = self.answers.get("name", "")
+        age = self.answers.get("age")
+        body["age"] = age if isinstance(age, int) else 0
+        body["gender"] = self.answers.get("gender", "U")
+
+        for f in ALL_BINARY_FIELDS:
+            val = self.answers.get(f)
+            body[f] = int(val) if isinstance(val, int) else 0
+
+        body_json_str = json.dumps(body, ensure_ascii=False)
+        output = {"body": body_json_str}
+        if self.cough_s3_uri:
+            output["cough_audio_s3"] = self.cough_s3_uri
+        return output
+
+    # ── Cough phase (3.6) ────────────────────────────────────────────────────
+    async def _cough_phase(self) -> None:
+        """Instruct client to record cough, receive WAV, upload to S3."""
+        self.state = State.COUGH_PHASE
+        self._send_state_update()
+
         await self._speak(
             "Now I will record your cough. Please cough three times after the beep.",
-            "अब मैं आपकी खांसी रिकॉर्ड करूँगा। बीप के बाद कृपया तीन बार खांसें।"
+            "अब मैं आपकी खांसी रिकॉर्ड करूँगा। बीप के बाद कृपया तीन बार खांसें।",
         )
-
-        # Wait for speech to finish playing
         await asyncio.sleep(2.0)
 
-        # End Nova session cleanly BEFORE recording
+        # Close Nova session before cough recording
         log_info("Closing Nova session for cough recording...")
         await self.nova.close_session()
         await asyncio.sleep(0.5)
 
-        # Record cough WAV
-        cough_path = "cough_recording.wav"
-        cough_seconds = self.args.cough_seconds
-        valid, burst_count = record_cough_wav(
-            cough_path,
-            seconds=cough_seconds,
-            input_device_index=self.args.input_device_index,
-            output_device_index=self.args.output_device_index,
-        )
-        log_info(f"Cough recording: valid={valid}, bursts={burst_count}")
+        # Tell client to start recording
+        self._cough_future = asyncio.get_event_loop().create_future()
+        self._send_to_client({"type": "cough_start", "duration": self.COUGH_DURATION})
 
-        # Upload to S3
-        self.cough_s3_uri = self.s3_uploader.upload_cough_wav(cough_path)
+        # Wait for client to send back the cough WAV
+        try:
+            cough_wav_bytes = await asyncio.wait_for(self._cough_future, timeout=30.0)
+        except asyncio.TimeoutError:
+            log_info("Cough recording timed out")
+            cough_wav_bytes = None
+        finally:
+            self._cough_future = None
 
-    # ── Main run loop ────────────────────────────────────────────────────────
+        if cough_wav_bytes:
+            self.cough_s3_uri = self.s3_uploader.upload_cough_wav(cough_wav_bytes)
+            log_info(f"Cough uploaded: {self.cough_s3_uri}")
+        else:
+            log_info("No cough audio received, skipping upload")
+
+    def receive_cough_audio(self, data_b64: str) -> None:
+        """Called by the handler when cough_audio message arrives from client."""
+        if self._cough_future and not self._cough_future.done():
+            try:
+                wav_bytes = base64.b64decode(data_b64)
+                self._cough_future.set_result(wav_bytes)
+            except Exception as e:
+                self._cough_future.set_exception(e)
+
+    # ── Main run loop (3.7) ──────────────────────────────────────────────────
     async def run(self) -> dict:
         """Execute the full intake flow. Returns the final output dict."""
         try:
-            # Open Nova session
             await self.nova.open_session(self.SYSTEM_PROMPT)
 
             # 1) Language selection
             self.state = State.LANGUAGE_SELECT
             await self._select_language()
 
-            # 2) Ask each intake question sequentially
+            # 2) Ask each intake question
             for i, q in enumerate(INTAKE_QUESTIONS):
                 self.question_index = i
                 log_info(f"Question {i + 1}/{len(INTAKE_QUESTIONS)}: {q.key}")
@@ -1251,7 +994,7 @@ class HealthIntakeAgent:
             await self.nova.open_session(self.SYSTEM_PROMPT)
             await self._speak(
                 "Thank you. Your health intake is complete.",
-                "धन्यवाद। आपका स्वास्थ्य सेवन पूरा हो गया है।"
+                "धन्यवाद। आपका स्वास्थ्य सेवन पूरा हो गया है।",
             )
             await asyncio.sleep(3.0)
             await self.nova.close_session()
@@ -1259,138 +1002,217 @@ class HealthIntakeAgent:
             # 5) Build and upload final JSON
             self.state = State.DONE
             output = self._build_output()
-
-            # Upload
             json_s3 = self.s3_uploader.upload_final_json(output)
+            log_info(f"Final JSON uploaded: {json_s3}")
 
-            # Print
-            print("\n" + "=" * 60)
-            print("FINAL OUTPUT:")
-            print("=" * 60)
-            print(json.dumps(output, indent=2, ensure_ascii=False))
-            print(f"\nJSON uploaded to: {json_s3}")
-            print(f"Cough audio: {self.cough_s3_uri}")
-            print("=" * 60)
+            # Send result to client
+            self._send_to_client({"type": "result", "data": output})
+            self._send_state_update()
 
             return output
 
-        except KeyboardInterrupt:
-            log_info("Interrupted by user")
-            raise
         except Exception as e:
-            log_info(f"Agent error: {e}")
+            log_info(f"ConversationManager error: {e}")
             import traceback
             traceback.print_exc()
+            self._send_to_client({"type": "error", "message": str(e)})
             raise
         finally:
-            # Ensure cleanup
             try:
                 await self.nova.close_session()
             except Exception:
                 pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CLI & Entry Point
-# ═══════════════════════════════════════════════════════════════════════════════
-def list_audio_devices() -> None:
-    """Print all available audio devices."""
-    p = pyaudio.PyAudio()
+# ─── Session store ───────────────────────────────────────────────────────────
+# Module-level dict keyed by connectionId. Each value holds session state
+# for the duration of the WebSocket connection.
+SESSIONS: dict[str, dict] = {}
+
+
+def _get_apigw_client(domain_name: str, stage: str):
+    """Create an API Gateway Management API client for posting messages back to the client."""
+    endpoint_url = f"https://{domain_name}/{stage}"
+    return boto3.client("apigatewaymanagementapi", endpoint_url=endpoint_url)
+
+
+def _send_to_client(apigw_client, connection_id: str, message: dict) -> None:
+    """Send a JSON message to the connected WebSocket client."""
     try:
-        n = p.get_device_count()
-        print(f"\nDetected {n} audio device(s):\n")
-        for i in range(n):
-            info = p.get_device_info_by_index(i)
-            name = info.get("name", "?")
-            in_ch = int(info.get("maxInputChannels", 0))
-            out_ch = int(info.get("maxOutputChannels", 0))
-            sr = int(info.get("defaultSampleRate", 0))
-            marker = ""
-            if in_ch > 0 and out_ch > 0:
-                marker = " [IN+OUT]"
-            elif in_ch > 0:
-                marker = " [IN]"
-            elif out_ch > 0:
-                marker = " [OUT]"
-            print(f"  [{i}] {name}  in={in_ch} out={out_ch} sr={sr}{marker}")
-        print()
-    finally:
-        p.terminate()
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Nova 2 Sonic – Multilingual Health Intake Voice Agent",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # macOS
-  python nova_sonic_health_intake_agent.py --s3-bucket my-health-bucket --voice-id arjun
-
-  # Windows
-  python nova_sonic_health_intake_agent.py --s3-bucket my-health-bucket --voice-id arjun --input-device-index 1
-
-  # List audio devices
-  python nova_sonic_health_intake_agent.py --list-audio-devices --s3-bucket dummy
-
-  # Debug mode
-  python nova_sonic_health_intake_agent.py --s3-bucket my-bucket --debug-events --debug-audio
-""",
-    )
-    parser.add_argument("--s3-bucket", required=True, help="S3 bucket for uploads (required)")
-    parser.add_argument("--model-id", default="amazon.nova-2-sonic-v1:0", help="Bedrock model ID")
-    parser.add_argument("--region", default=os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1")),
-                        help="AWS region (default: from env or us-east-1)")
-    parser.add_argument("--voice-id", default="arjun", help="Nova Sonic voice ID (default: arjun)")
-    parser.add_argument("--input-device-index", type=int, default=None, help="PyAudio input device index")
-    parser.add_argument("--output-device-index", type=int, default=None, help="PyAudio output device index")
-    parser.add_argument("--cough-seconds", type=int, default=8, help="Cough recording duration in seconds (default: 8)")
-    parser.add_argument("--debug-events", action="store_true", help="Log all streaming events")
-    parser.add_argument("--debug-audio", action="store_true", help="Log audio chunk details")
-    parser.add_argument("--list-audio-devices", action="store_true", help="List audio devices and exit")
-    return parser.parse_args()
-
-
-async def async_main() -> None:
-    args = parse_args()
-
-    # Set debug flags
-    global DEBUG_EVENTS, DEBUG_AUDIO
-    DEBUG_EVENTS = args.debug_events
-    DEBUG_AUDIO = args.debug_audio
-
-    if args.list_audio_devices:
-        list_audio_devices()
-        return
-
-    print()
-    print("=" * 60)
-    print("  Nova 2 Sonic – Health Intake Voice Agent")
-    print(f"  Model:  {args.model_id}")
-    print(f"  Region: {args.region}")
-    print(f"  Voice:  {args.voice_id}")
-    print(f"  Bucket: {args.s3_bucket}")
-    print("=" * 60)
-    print()
-
-    agent = HealthIntakeAgent(args)
-    await agent.run()
-
-
-if __name__ == "__main__":
-    # Suppress noisy CRT InvalidStateError on teardown
-    import warnings
-    warnings.filterwarnings("ignore")
-
-    import logging
-    logging.getLogger("awscrt").setLevel(logging.CRITICAL)
-
-    try:
-        asyncio.run(async_main())
-    except KeyboardInterrupt:
-        print("\nExiting.")
+        apigw_client.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps(message).encode("utf-8"),
+        )
     except Exception as e:
-        print(f"\nFatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        log_info(f"Failed to send to {connection_id}: {e}")
+
+
+# ─── Lambda handler ──────────────────────────────────────────────────────────
+def handler(event, context):
+    """
+    API Gateway v2 WebSocket handler.
+    Routes $connect, $disconnect, and $default events.
+    """
+    request_context = event.get("requestContext", {})
+    route_key = request_context.get("routeKey")
+    connection_id = request_context.get("connectionId")
+    domain_name = request_context.get("domainName", "")
+    stage = request_context.get("stage", "")
+
+    log_info(f"Route: {route_key} | Connection: {connection_id}")
+
+    if route_key == "$connect":
+        return _handle_connect(connection_id, domain_name, stage)
+    elif route_key == "$disconnect":
+        return _handle_disconnect(connection_id)
+    elif route_key == "$default":
+        return _handle_default(event, connection_id, domain_name, stage)
+    else:
+        log_info(f"Unknown route: {route_key}")
+        return {"statusCode": 400, "body": "Unknown route"}
+
+
+def _handle_connect(connection_id: str, domain_name: str, stage: str) -> dict:
+    """Initialize session state on WebSocket connect."""
+    apigw_client = _get_apigw_client(domain_name, stage)
+    conversation_mgr = ConversationManager(connection_id, apigw_client)
+    SESSIONS[connection_id] = {
+        "connection_id": connection_id,
+        "domain_name": domain_name,
+        "stage": stage,
+        "conversation_manager": conversation_mgr,
+        "stream_manager": conversation_mgr.nova,
+        "run_task": None,
+    }
+    log_info(f"Session created for {connection_id}")
+    return {"statusCode": 200, "body": "Connected"}
+
+
+def _handle_disconnect(connection_id: str) -> dict:
+    """Clean up session state on WebSocket disconnect."""
+    session = SESSIONS.pop(connection_id, None)
+    if session:
+        # The conversation thread is a daemon thread and will be cleaned up
+        # when the Lambda container is recycled
+        log_info(f"Session cleaned up for {connection_id}")
+    else:
+        log_info(f"No session found for {connection_id}")
+    return {"statusCode": 200, "body": "Disconnected"}
+
+
+def _handle_default(event: dict, connection_id: str, domain_name: str, stage: str) -> dict:
+    """Parse incoming message and dispatch by type field."""
+    session = SESSIONS.get(connection_id)
+    if not session:
+        log_info(f"No session for {connection_id}, ignoring message")
+        return {"statusCode": 400, "body": "No active session"}
+
+    # Parse message body
+    body = event.get("body", "")
+    try:
+        message = json.loads(body) if isinstance(body, str) else body
+    except (json.JSONDecodeError, TypeError):
+        log_info(f"Invalid JSON from {connection_id}: {body[:100]}")
+        return {"statusCode": 400, "body": "Invalid JSON"}
+
+    msg_type = message.get("type", "")
+    apigw_client = _get_apigw_client(domain_name, stage)
+
+    if msg_type == "audio":
+        # Audio data from client mic — will be forwarded to Bedrock in task 2
+        _handle_audio(session, message, apigw_client, connection_id)
+    elif msg_type == "cough_audio":
+        # Cough WAV recording from client — will be handled in task 3
+        _handle_cough_audio(session, message, apigw_client, connection_id)
+    elif msg_type == "control":
+        # Control messages (e.g. start conversation)
+        _handle_control(session, message, apigw_client, connection_id)
+    else:
+        log_info(f"Unknown message type '{msg_type}' from {connection_id}")
+        _send_to_client(apigw_client, connection_id, {
+            "type": "error",
+            "message": f"Unknown message type: {msg_type}",
+        })
+
+    return {"statusCode": 200, "body": "OK"}
+
+
+def _handle_audio(session: dict, message: dict, apigw_client, connection_id: str) -> None:
+    """Handle incoming audio chunk from client. Forward to Bedrock via the stream manager."""
+    data = message.get("data", "")
+    if data:
+        stream_mgr = session.get("stream_manager")
+        if stream_mgr and stream_mgr.is_active:
+            audio_bytes = base64.b64decode(data)
+            loop = session.get("event_loop")
+            if loop and loop.is_running():
+                # Schedule onto the conversation thread's event loop (thread-safe)
+                loop.call_soon_threadsafe(stream_mgr.audio_input_queue.put_nowait, audio_bytes)
+            else:
+                try:
+                    stream_mgr.audio_input_queue.put_nowait(audio_bytes)
+                except Exception:
+                    pass
+
+
+def _handle_cough_audio(session: dict, message: dict, apigw_client, connection_id: str) -> None:
+    """Handle cough WAV recording from client. Forward to ConversationManager."""
+    log_info(f"Cough audio received from {connection_id}")
+    conv_mgr: Optional[ConversationManager] = session.get("conversation_manager")
+    if conv_mgr:
+        data = message.get("data", "")
+        if data:
+            loop = session.get("event_loop")
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(conv_mgr.receive_cough_audio, data)
+            else:
+                conv_mgr.receive_cough_audio(data)
+
+
+def _handle_control(session: dict, message: dict, apigw_client, connection_id: str) -> None:
+    """Handle control messages — start spawns the conversation in a background thread."""
+    action = message.get("action", "")
+    log_info(f"Control action '{action}' from {connection_id}")
+
+    if action == "start":
+        conv_mgr: Optional[ConversationManager] = session.get("conversation_manager")
+        if not conv_mgr:
+            _send_to_client(apigw_client, connection_id, {
+                "type": "error",
+                "message": "No conversation manager for this session",
+            })
+            return
+
+        # Don't start twice
+        run_thread = session.get("run_thread")
+        if run_thread and run_thread.is_alive():
+            log_info(f"Conversation already running for {connection_id}")
+            return
+
+        # Run the async conversation in a dedicated thread with its own event loop.
+        # This allows the Lambda invocation to return immediately while the
+        # conversation continues in the background. Subsequent audio/message
+        # invocations on the same warm container feed data via the shared
+        # audio_input_queue.
+        def _run_conversation():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            # Store the loop so audio handlers can schedule onto it
+            session["event_loop"] = loop
+            try:
+                loop.run_until_complete(conv_mgr.run())
+            except Exception as e:
+                log_info(f"Conversation thread error: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_run_conversation, daemon=True)
+        thread.start()
+        session["run_thread"] = thread
+    else:
+        _send_to_client(apigw_client, connection_id, {
+            "type": "error",
+            "message": f"Unknown control action: {action}",
+        })

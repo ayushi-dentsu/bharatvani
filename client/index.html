@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Health Intake Voice Agent</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #222; padding: 20px; max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin-bottom: 12px; }
+  .config { display: flex; gap: 8px; margin-bottom: 16px; }
+  .config input { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9rem; }
+  button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #connectBtn { background: #0073bb; color: #fff; }
+  #startBtn { background: #2e7d32; color: #fff; margin-left: 8px; }
+  #disconnectBtn { background: #c62828; color: #fff; margin-left: 8px; }
+  .status-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding: 8px 12px; background: #fff; border-radius: 4px; border: 1px solid #ddd; font-size: 0.85rem; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #999; flex-shrink: 0; }
+  .status-dot.connected { background: #2e7d32; }
+  .status-dot.error { background: #c62828; }
+  #transcript { background: #fff; border: 1px solid #ddd; border-radius: 4px; padding: 12px; height: 360px; overflow-y: auto; margin-bottom: 16px; font-size: 0.9rem; line-height: 1.5; }
+  .msg { margin-bottom: 8px; padding: 6px 10px; border-radius: 6px; max-width: 85%; }
+  .msg.assistant { background: #e3f2fd; align-self: flex-start; }
+  .msg.user { background: #e8f5e9; align-self: flex-end; margin-left: auto; }
+  .msg.system { background: #fff3e0; font-style: italic; font-size: 0.82rem; color: #555; }
+  .msg.error { background: #ffebee; color: #c62828; }
+  .msg.result { background: #f3e5f5; white-space: pre-wrap; font-family: monospace; font-size: 0.8rem; }
+  #coughOverlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 10; justify-content: center; align-items: center; }
+  #coughOverlay.active { display: flex; }
+  #coughBox { background: #fff; padding: 32px; border-radius: 8px; text-align: center; }
+  #coughBox p { margin-bottom: 12px; font-size: 1.1rem; }
+  #coughTimer { font-size: 2rem; font-weight: bold; color: #c62828; }
+</style>
+</head>
+<body>
+
+<h1>🩺 Health Intake Voice Agent</h1>
+
+<div class="config">
+  <input id="wsUrl" type="text" value="ws://54.164.3.166:8080" placeholder="ws://your-ecs-ip:8080">
+  <button id="connectBtn" onclick="toggleConnection()">Connect</button>
+  <button id="startBtn" onclick="startConversation()" disabled>Start</button>
+  <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+</div>
+
+<div class="status-bar">
+  <span class="status-dot" id="statusDot"></span>
+  <span id="statusText">Disconnected</span>
+  <span style="margin-left:auto" id="stateLabel"></span>
+</div>
+
+<div id="transcript"></div>
+
+<div id="coughOverlay">
+  <div id="coughBox">
+    <p>🎤 Recording cough...</p>
+    <p>Please cough 3 times</p>
+    <div id="coughTimer"></div>
+  </div>
+</div>
+
+<script>
+// ─── Globals ────────────────────────────────────────────────────────────────
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let scriptNode = null;
+let playbackCtx = null;
+let nextPlayTime = 0;
+const INPUT_SAMPLE_RATE = 16000;
+const OUTPUT_SAMPLE_RATE = 24000;
+const BUFFER_SIZE = 4096;
+
+// ─── DOM refs ───────────────────────────────────────────────────────────────
+const wsUrlInput    = document.getElementById('wsUrl');
+const connectBtn    = document.getElementById('connectBtn');
+const startBtn      = document.getElementById('startBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+const statusDot     = document.getElementById('statusDot');
+const statusText    = document.getElementById('statusText');
+const stateLabel    = document.getElementById('stateLabel');
+const transcript    = document.getElementById('transcript');
+const coughOverlay  = document.getElementById('coughOverlay');
+const coughTimer    = document.getElementById('coughTimer');
+
+// ─── WebSocket ──────────────────────────────────────────────────────────────
+function toggleConnection() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    disconnect();
+  } else {
+    connect();
+  }
+}
+
+function connect() {
+  const url = wsUrlInput.value.trim();
+  if (!url) { alert('Enter a WebSocket URL'); return; }
+
+  setStatus('connecting', 'Connecting...');
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    setStatus('connected', 'Connected');
+    startBtn.disabled = false;
+    disconnectBtn.disabled = false;
+    connectBtn.textContent = 'Reconnect';
+    addMessage('system', 'Connected to server. Press Start to begin.');
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      handleServerMessage(msg);
+    } catch (e) {
+      console.error('Bad message:', e);
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus('disconnected', 'Disconnected');
+    startBtn.disabled = true;
+    disconnectBtn.disabled = true;
+    connectBtn.textContent = 'Connect';
+    stopMic();
+  };
+
+  ws.onerror = (err) => {
+    console.error('WebSocket error:', err);
+    setStatus('error', 'Connection error');
+  };
+}
+
+function disconnect() {
+  stopMic();
+  if (ws) { ws.close(); ws = null; }
+}
+
+// ─── Message handling ───────────────────────────────────────────────────────
+function handleServerMessage(msg) {
+  switch (msg.type) {
+    case 'audio':
+      playAudio(msg.data);
+      break;
+    case 'transcript':
+      addMessage(msg.role || 'assistant', msg.text);
+      break;
+    case 'state':
+      updateState(msg.state, msg.question);
+      break;
+    case 'cough_start':
+      startCoughRecording(msg.duration || 8);
+      break;
+    case 'result':
+      addMessage('result', JSON.stringify(msg.data, null, 2));
+      addMessage('system', 'Intake complete.');
+      stopMic();
+      break;
+    case 'error':
+      addMessage('error', msg.message);
+      break;
+    default:
+      console.log('Unknown message type:', msg.type);
+  }
+}
+
+// ─── Start conversation ─────────────────────────────────────────────────────
+async function startConversation() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  startBtn.disabled = true;
+  transcript.innerHTML = '';
+  lastAssistantMsg = '';
+  lastUserMsg = '';
+
+  // Init playback context
+  if (playbackCtx) playbackCtx.close();
+  playbackCtx = new AudioContext({ sampleRate: OUTPUT_SAMPLE_RATE });
+  nextPlayTime = 0;
+
+  await startMic();
+  ws.send(JSON.stringify({ type: 'control', action: 'start' }));
+  addMessage('system', 'Conversation started. Speak when prompted.');
+}
+
+// ─── Mic capture ────────────────────────────────────────────────────────────
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: INPUT_SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+  } catch (e) {
+    addMessage('error', 'Microphone access denied: ' + e.message);
+    return;
+  }
+
+  audioCtx = new AudioContext({ sampleRate: INPUT_SAMPLE_RATE });
+  const source = audioCtx.createMediaStreamSource(micStream);
+
+  // ScriptProcessorNode for PCM capture (widely supported)
+  scriptNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+  scriptNode.onaudioprocess = (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const float32 = e.inputBuffer.getChannelData(0);
+    const pcm16 = float32ToPcm16(float32);
+    const b64 = arrayBufferToBase64(pcm16.buffer);
+    ws.send(JSON.stringify({ type: 'audio', data: b64 }));
+  };
+
+  source.connect(scriptNode);
+  scriptNode.connect(audioCtx.destination); // required for onaudioprocess to fire
+}
+
+function stopMic() {
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+}
+
+// ─── Audio playback ─────────────────────────────────────────────────────────
+function playAudio(b64Data) {
+  if (!playbackCtx) return;
+  const pcm16 = base64ToPcm16(b64Data);
+  const float32 = pcm16ToFloat32(pcm16);
+
+  const buffer = playbackCtx.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
+  buffer.getChannelData(0).set(float32);
+
+  const src = playbackCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(playbackCtx.destination);
+
+  const now = playbackCtx.currentTime;
+  if (nextPlayTime < now) nextPlayTime = now;
+  src.start(nextPlayTime);
+  nextPlayTime += buffer.duration;
+}
+
+// ─── Cough recording ───────────────────────────────────────────────────────
+async function startCoughRecording(duration) {
+  coughOverlay.classList.add('active');
+  let remaining = duration;
+  coughTimer.textContent = remaining;
+  const interval = setInterval(() => {
+    remaining--;
+    coughTimer.textContent = remaining > 0 ? remaining : '...';
+    if (remaining <= 0) clearInterval(interval);
+  }, 1000);
+
+  try {
+    // Use a fresh stream for cough recording
+    const coughStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const recorder = new MediaRecorder(coughStream, { mimeType: 'audio/webm;codecs=opus' });
+    const chunks = [];
+
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+    const done = new Promise((resolve) => {
+      recorder.onstop = () => {
+        coughStream.getTracks().forEach(t => t.stop());
+        resolve(new Blob(chunks, { type: 'audio/webm' }));
+      };
+    });
+
+    // Play a beep before recording
+    playBeep();
+    await sleep(500);
+
+    recorder.start();
+    await sleep(duration * 1000);
+    recorder.stop();
+
+    const blob = await done;
+    // Convert to WAV for the Lambda
+    const wavB64 = await blobToWavBase64(blob);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'cough_audio', data: wavB64 }));
+    }
+    addMessage('system', 'Cough recording sent.');
+  } catch (e) {
+    addMessage('error', 'Cough recording failed: ' + e.message);
+  } finally {
+    clearInterval(interval);
+    coughOverlay.classList.remove('active');
+  }
+}
+
+// ─── WAV conversion ─────────────────────────────────────────────────────────
+async function blobToWavBase64(blob) {
+  // Decode the webm blob to raw PCM via AudioContext, then encode as WAV
+  const arrayBuf = await blob.arrayBuffer();
+  const decodeCtx = new AudioContext({ sampleRate: 16000 });
+  const audioBuf = await decodeCtx.decodeAudioData(arrayBuf);
+  decodeCtx.close();
+
+  const pcmFloat = audioBuf.getChannelData(0);
+  const pcm16 = float32ToPcm16(pcmFloat);
+  const wavBytes = encodeWav(pcm16, 16000);
+  return arrayBufferToBase64(wavBytes);
+}
+
+function encodeWav(pcm16, sampleRate) {
+  const numSamples = pcm16.length;
+  const byteRate = sampleRate * 2; // 16-bit mono
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+
+  // RIFF header
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeString(view, 8, 'WAVE');
+  // fmt chunk
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  // data chunk
+  writeString(view, 36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+  for (let i = 0; i < numSamples; i++) {
+    view.setInt16(44 + i * 2, pcm16[i], true);
+  }
+  return buffer;
+}
+
+function writeString(view, offset, str) {
+  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+}
+
+// ─── Audio conversion utils ─────────────────────────────────────────────────
+function float32ToPcm16(float32) {
+  const pcm16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return pcm16;
+}
+
+function pcm16ToFloat32(pcm16) {
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) {
+    float32[i] = pcm16[i] / (pcm16[i] < 0 ? 0x8000 : 0x7FFF);
+  }
+  return float32;
+}
+
+function base64ToPcm16(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Int16Array(bytes.buffer);
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+// ─── UI helpers ─────────────────────────────────────────────────────────────
+function setStatus(state, text) {
+  statusDot.className = 'status-dot';
+  if (state === 'connected') statusDot.classList.add('connected');
+  else if (state === 'error') statusDot.classList.add('error');
+  statusText.textContent = text;
+}
+
+function updateState(state, question) {
+  let label = state || '';
+  if (question) label += ' — ' + question;
+  stateLabel.textContent = label;
+}
+
+let lastAssistantMsg = '';
+let lastUserMsg = '';
+
+function addMessage(type, text) {
+  // Deduplicate consecutive identical messages
+  if (type === 'assistant') {
+    if (text === lastAssistantMsg) return;
+    lastAssistantMsg = text;
+  } else if (type === 'user') {
+    if (text === lastUserMsg) return;
+    lastUserMsg = text;
+  }
+  const div = document.createElement('div');
+  div.className = 'msg ' + type;
+  const prefix = type === 'assistant' ? '🤖 ' : type === 'user' ? '🗣️ ' : '';
+  div.textContent = prefix + text;
+  transcript.appendChild(div);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function playBeep() {
+  const ctx = new AudioContext();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.frequency.value = 800;
+  gain.gain.value = 0.3;
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start();
+  osc.stop(ctx.currentTime + 0.3);
+  setTimeout(() => ctx.close(), 500);
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+</script>
+</body>
+</html>
