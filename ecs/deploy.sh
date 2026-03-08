@@ -97,6 +97,11 @@ else
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:GetObject"],
       "Resource": "arn:aws:s3:::${S3_BUCKET}/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/bharatvani-health-records-demo"
     }
   ]
 }
@@ -147,7 +152,8 @@ TASK_DEF=$(cat <<EOF
         {"name": "S3_BUCKET", "value": "${S3_BUCKET}"},
         {"name": "BEDROCK_MODEL_ID", "value": "${BEDROCK_MODEL_ID}"},
         {"name": "VOICE_ID", "value": "${VOICE_ID}"},
-        {"name": "PORT", "value": "${CONTAINER_PORT}"}
+        {"name": "PORT", "value": "${CONTAINER_PORT}"},
+        {"name": "SCREENING_TABLE", "value": "bharatvani-health-records-demo"}
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
