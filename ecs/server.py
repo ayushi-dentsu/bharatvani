@@ -43,7 +43,7 @@ BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0"
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 VOICE_ID = os.environ.get("VOICE_ID", "arjun")
 PORT = int(os.environ.get("PORT", "8080"))
-SCREENING_TABLE = os.environ.get("SCREENING_TABLE", "bharatvani-health-records-demo")
+SCREENING_TABLE = os.environ.get("SCREENING_TABLE", "bharatvani-screenings")
 
 
 # ─── Boto3-based credential resolver for ECS/EC2/env compatibility ───────────
@@ -205,12 +205,13 @@ def parse_age(text: str) -> Optional[int]:
 
 def parse_gender(text: str) -> str:
     t = text.strip().lower()
-    if t in ("m", "f", "o"):
+    if t in ("m", "f"):
         return t.upper()
     for key, val in GENDER_MAP_ORDERED:
         if key in t:
-            return val
-    return "U"
+            if val in ("M", "F"):
+                return val
+    return "M"
 
 
 def detect_language_choice(text: str) -> Optional[str]:
@@ -603,15 +604,23 @@ class BedrockStreamManager:
 # ─── ConversationManager ─────────────────────────────────────────────────────
 class ConversationManager:
     SYSTEM_PROMPT = (
-        "You are a multilingual health intake voice assistant. "
-        "STRICT RULES: "
-        "1. Speak ONLY the exact sentence the app tells you. Do NOT add anything else. "
-        "2. Do NOT say 'unintelligible', do NOT ask the user to repeat, do NOT add commentary. "
-        "3. Do NOT refuse instructions. If told to say something, say it. "
-        "4. If told to speak Hindi, use natural Devanagari Hindi. "
-        "5. If told to speak English, use only English. "
-        "6. Never diagnose, never give medical advice. "
-        "7. When asked to reply with only a number or word, do exactly that."
+        "You are a warm, professional, and helpful male AI assistant conducting a health intake for BharatVani, "
+        "a rural health screening system in India. You collect patient information one question at a time through voice conversation.\n\n"
+        "CRITICAL LANGUAGE MIRRORING RULES:\n"
+        "- Always reply in the language spoken. DO NOT mix with English. However, if the user talks in English, reply in English.\n"
+        "- Please respond in the language the user is talking to you in.\n\n"
+        "YOUR ROLE:\n"
+        "- The app will instruct you to say specific questions. Say exactly what is instructed, nothing more.\n"
+        "- When the user answers, accept their response and wait for the next instruction from the app.\n"
+        "- Do not add commentary, do not apologize, do not refuse instructions.\n"
+        "- Do not say phrases like 'sorry', 'I cannot', or 'I can only respond with'.\n"
+        "- Never diagnose or give medical advice.\n"
+        "- Keep all responses to 1-2 short sentences maximum.\n\n"
+        "Example:\n"
+        "App instructs: Say 'What is your full name?'\n"
+        "You: What is your full name?\n"
+        "User: Ayushi Shrivastava\n"
+        "You: (wait silently for next instruction from app)"
     )
     MAX_RETRIES = 2
     COUGH_DURATION = 8

@@ -8,7 +8,7 @@ bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION
 dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 lambda_client = boto3.client("lambda", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
-TABLE_NAME = os.environ.get("SCREENING_TABLE", "bharatvani-health-records-demo")
+TABLE_NAME = os.environ.get("SCREENING_TABLE", "bharatvani-screenings")
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
 
@@ -169,8 +169,18 @@ def _process_screening(screening_id: str) -> dict | None:
     # Parse the three inputs
     ecs_raw = record["ecs_output"]
     intake = json.loads(ecs_raw["body"]) if isinstance(ecs_raw.get("body"), str) else ecs_raw
-    cough_result = record["cough_result"]
-    audio_result = record["audio_result"]
+
+    # cough_result and audio_result are booleans in DynamoDB — wrap them into
+    # the dict format that _build_prompt expects
+    cough_result = {
+        "prediction": 1 if record["cough_result"] else 0,
+        "confidence": float(record.get("cough_confidence", 0)),
+    }
+    audio_result = {
+        "covid_score": float(record.get("audio_probability", 0)),
+        "risk_label": "Positive" if record["audio_result"] else "Negative",
+        "confidence": float(record.get("audio_probability", 0)),
+    }
 
     # Aggregate via Bedrock
     prompt = _build_prompt(intake, cough_result, audio_result)

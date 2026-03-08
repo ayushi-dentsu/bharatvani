@@ -7,7 +7,7 @@ set -euo pipefail
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 FUNCTION_NAME="${FUNCTION_NAME:-bharatvani-screening-aggregator}"
-SCREENING_TABLE="${SCREENING_TABLE:-bharatvani-health-records-demo}"
+SCREENING_TABLE="${SCREENING_TABLE:-bharatvani-screenings}"
 BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-anthropic.claude-3-haiku-20240307-v1:0}"
 ROLE_NAME="${FUNCTION_NAME}-role"
 
@@ -76,7 +76,7 @@ zip -r function.zip screening_aggregator.py
 cd "${SCRIPT_DIR}"
 
 # ─── 4. Create or update Lambda function ────────────────────────────────────
-ENV_VARS="{\"Variables\":{\"SCREENING_TABLE\":\"${SCREENING_TABLE}\",\"BEDROCK_MODEL_ID\":\"${BEDROCK_MODEL_ID}\",\"AWS_REGION_NAME\":\"${AWS_REGION}\"}}"
+ENV_VARS="{\"Variables\":{\"SCREENING_TABLE\":\"${SCREENING_TABLE}\",\"BEDROCK_MODEL_ID\":\"${BEDROCK_MODEL_ID}\"}}"
 
 if aws lambda get-function --function-name "${FUNCTION_NAME}" --region "${AWS_REGION}" > /dev/null 2>&1; then
   echo "==> Updating Lambda function code..."

@@ -16,7 +16,7 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 SERVICE_NAME="${SERVICE_NAME:-nova-sonic-intake}"
 ECR_REPO="${ECR_REPO:-nova-sonic-intake-ecs}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
-S3_BUCKET="${S3_BUCKET:-}"
+S3_BUCKET="${S3_BUCKET:-ivr-call-recordings-797882812707-us-east-1}"
 BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-amazon.nova-2-sonic-v1:0}"
 VOICE_ID="${VOICE_ID:-arjun}"
 CLUSTER_NAME="${SERVICE_NAME}-cluster"
@@ -101,7 +101,7 @@ else
     {
       "Effect": "Allow",
       "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"],
-      "Resource": "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/bharatvani-health-records-demo"
+      "Resource": "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/bharatvani-screenings"
     }
   ]
 }
@@ -153,7 +153,7 @@ TASK_DEF=$(cat <<EOF
         {"name": "BEDROCK_MODEL_ID", "value": "${BEDROCK_MODEL_ID}"},
         {"name": "VOICE_ID", "value": "${VOICE_ID}"},
         {"name": "PORT", "value": "${CONTAINER_PORT}"},
-        {"name": "SCREENING_TABLE", "value": "bharatvani-health-records-demo"}
+        {"name": "SCREENING_TABLE", "value": "bharatvani-screenings"}
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
