@@ -1,250 +1,244 @@
-# BharatVani Cost Analysis - Serverless Lambda Architecture
+# BharatVani Cost Analysis — Actual Architecture
 
-## Overview
+## Architecture Summary
 
-This document provides a comprehensive cost breakdown for BharatVani using a **pure serverless Lambda architecture**. This approach eliminates expensive ML infrastructure costs and enables bootstrap funding with minimal capital requirements.
+| Component | AWS Service | Config |
+|-----------|------------|--------|
+| Frontend | CloudFront + S3 | Static React app |
+| WebSocket Server | ECS Fargate | 1 vCPU, 2 GB RAM, always-on |
+| Voice AI | Amazon Nova Sonic (Bedrock) | Bidirectional streaming STT+TTS |
+| Audio Predictor | Lambda (Docker, 1024 MB, 60s timeout) | librosa + XGBoost ML inference |
+| Cough Predictor | Lambda (Docker, 512 MB, 60s timeout) | scikit-learn + XGBoost ML inference |
+| Screening Aggregator | Lambda (Python, 256 MB, 60s timeout) | Calls Nova Lite LLM |
+| Get Screening API | Lambda (Python, 128 MB) + API Gateway HTTP | DynamoDB read |
+| Report Generation | Amazon Nova Lite (Bedrock) | ~1K token prompt, ~500 token response |
+| Storage | S3 (recordings) + DynamoDB (screenings) | On-demand |
+| Load Balancer | ALB | HTTP listener, 1 target |
 
-**Key Assumption**: Development team working for free (typical for hackathons and early-stage startups)
+---
 
-## 💰 Infrastructure Costs (Lambda-First Architecture)
+## Per-Screening Cost Breakdown
 
-### Phase 1: Hackathon MVP (48 hours)
+Assumptions per screening:
+- ~3 minute voice conversation with Nova Sonic
+- 1 WAV cough recording (~150 KB) + 1 JSON file (~1 KB) uploaded to S3
+- 3 Lambda invocations (audio predictor, cough predictor, aggregator)
+- 1 Nova Lite LLM call for report generation
+- 1 API Gateway call to poll results
+- 1 DynamoDB write (ECS) + 3 updates (2 ML + 1 aggregator) + ~10 reads (polling)
 
-#### AWS Services (Demo Period)
-- **Amazon Connect**: $0.038/min × 100 demo calls × 3 min = $11.40
-- **Lambda Functions**: 
-  - Audio Processing: $0.0000166667/GB-sec × 1000 executions = $2
-  - ML Inference: $0.0000166667/GB-sec × 1000 executions = $2
-  - SMS Processing: $0.0000166667/GB-sec × 1000 executions = $1
-- **S3**: 10GB storage + requests = $3
-- **DynamoDB**: On-demand, minimal usage = $2
-- **SNS SMS**: $0.069/SMS × 100 messages = $6.90
-- **CloudWatch**: Basic monitoring = $2
-- **Total AWS (Hackathon)**: ~$30 (₹2,475)
 
-#### Additional Services
-- **Domain Registration**: $12/year = $1 (₹83)
-- **SSL Certificate**: Free (Let's Encrypt)
-- **Development Tools**: Free (VS Code, Git, etc.)
+### 1. Amazon Nova Sonic (Voice Conversation)
 
-**Phase 1 Total**: ₹2,558 (~$31) 🎉
+| Metric | Value |
+|--------|-------|
+| Speech input tokens | ~$0.0034 / 1K tokens |
+| Speech output tokens | ~$0.0136 / 1K tokens |
+| Estimated per 3-min call | ~$0.05 |
 
-### Phase 2: Pilot Deployment (3 months)
+A 3-minute bidirectional voice session generates roughly 1.5K speech input tokens and 1.5K speech output tokens.
 
-#### Monthly Infrastructure Costs
-**Month 1** (1,000 screenings):
-- Amazon Connect: $114 (₹9,405)
-- Lambda Functions: $8 (₹660)
-- S3 Storage: $5 (₹413)
-- DynamoDB: $10 (₹825)
-- SNS SMS: $69 (₹5,693) *[using international rates]*
-- CloudWatch: $5 (₹413)
-- **Monthly Total**: $211 (₹17,409)
+**Cost per screening: ~$0.05 (₹4.13)**
 
-**Month 2** (2,500 screenings):
-- Amazon Connect: $285 (₹23,513)
-- Lambda Functions: $20 (₹1,650)
-- S3 Storage: $8 (₹660)
-- DynamoDB: $25 (₹2,063)
-- SNS SMS: $173 (₹14,273)
-- CloudWatch: $8 (₹660)
-- **Monthly Total**: $519 (₹42,819)
+### 2. ECS Fargate (WebSocket Server — Always On)
 
-**Month 3** (4,000 screenings):
-- Amazon Connect: $456 (₹37,620)
-- Lambda Functions: $32 (₹2,640)
-- S3 Storage: $12 (₹990)
-- DynamoDB: $40 (₹3,300)
-- SNS SMS: $276 (₹22,770)
-- CloudWatch: $12 (₹990)
-- **Monthly Total**: $828 (₹68,310)
+| Resource | Rate | Monthly |
+|----------|------|---------|
+| 1 vCPU | $0.04048/hr | $29.55 |
+| 2 GB RAM | $0.004445/GB/hr × 2 | $6.49 |
+| **Total** | **$0.049/hr** | **$36.04/month** |
 
-**Phase 2 Total**: ₹1,28,538 (~$1,558)
+This is a fixed cost — the ECS task runs 24/7 regardless of screening volume.
 
-### Phase 3: Early Scale (6 months)
+**Per screening (at 100/month): $0.36**
+**Per screening (at 1,000/month): $0.036**
+**Per screening (at 10,000/month): $0.0036**
 
-#### Monthly Infrastructure Costs (Growing Volume)
-**Months 4-6** (Average 8,000 screenings/month):
-- Amazon Connect: $912/month (₹75,240)
-- Lambda Functions: $64/month (₹5,280)
-- S3 Storage: $20/month (₹1,650)
-- DynamoDB: $80/month (₹6,600)
-- SNS SMS: $552/month (₹45,540) *[optimized with local sender ID]*
-- CloudWatch: $20/month (₹1,650)
-- **Monthly Total**: $1,648 (₹1,35,960)
+### 3. Audio Predictor Lambda
 
-**Months 7-9** (Average 15,000 screenings/month):
-- Amazon Connect: $1,710/month (₹1,41,075)
-- Lambda Functions: $120/month (₹9,900)
-- S3 Storage: $35/month (₹2,888)
-- DynamoDB: $150/month (₹12,375)
-- SNS SMS: $1,035/month (₹85,388) *[local rates: $0.00278/SMS]*
-- CloudWatch: $35/month (₹2,888)
-- **Monthly Total**: $3,085 (₹2,54,514)
+| Config | Value |
+|--------|-------|
+| Memory | 1024 MB (1 GB) |
+| Avg duration | ~8 seconds |
+| GB-seconds | 8 |
+| Cost/GB-sec | $0.0000166667 |
 
-**Phase 3 Total**: ₹11,71,422 (~$14,200)
+Compute: 8 × $0.0000166667 = $0.000133
+Request: $0.0000002
 
-## 🔄 Operational Costs (Per Screening) - Lambda Architecture
+**Cost per screening: ~$0.00014 (₹0.012)**
 
-### Detailed Cost Breakdown
+### 4. Cough Predictor Lambda
 
-| Component | Cost (USD) | Cost (INR) | Notes |
-|-----------|------------|------------|-------|
-| **Amazon Connect (IVR)** | $0.114 | ₹9.41 | 3-minute call |
-| **Lambda - Audio Processing** | $0.0008 | ₹0.07 | 1GB, 5 seconds |
-| **Lambda - ML Inference** | $0.0012 | ₹0.10 | 1GB, 8 seconds |
-| **Lambda - SMS Processing** | $0.0003 | ₹0.02 | 512MB, 2 seconds |
-| **S3 Storage & Requests** | $0.0003 | ₹0.02 | Audio file storage |
-| **DynamoDB Operations** | $0.001 | ₹0.08 | Health record storage |
-| **SNS SMS (Local)** | $0.00278 | ₹0.23 | With local sender ID |
-| **CloudWatch Logs** | $0.0002 | ₹0.02 | Monitoring & logging |
-| **Total per Screening** | **$0.119** | **₹9.95** |
+| Config | Value |
+|--------|-------|
+| Memory | 512 MB (0.5 GB) |
+| Avg duration | ~3 seconds |
+| GB-seconds | 1.5 |
+| Cost/GB-sec | $0.0000166667 |
 
-### Cost Optimization Strategies
+Compute: 1.5 × $0.0000166667 = $0.000025
+Request: $0.0000002
 
-#### Immediate Optimizations (Phase 1-2)
-1. **SMS Cost Reduction** (Biggest Impact)
-   - Register local sender ID in India: $0.00278 vs $0.069 per SMS
-   - **Savings**: 96% reduction in SMS costs
-   - **New SMS cost**: ₹0.23 per screening
+**Cost per screening: ~$0.000025 (₹0.002)**
 
-2. **Lambda Optimization**
-   - Use ARM-based Graviton2 processors: 20% cost reduction
-   - Optimize memory allocation based on actual usage
-   - **Potential savings**: 25% reduction in Lambda costs
+### 5. Screening Aggregator Lambda + Nova Lite
 
-3. **Audio Storage Optimization**
-   - Compress audio files using efficient codecs
-   - Implement intelligent lifecycle policies
-   - **Potential savings**: 50% reduction in storage costs
+| Component | Detail |
+|-----------|--------|
+| Lambda: 256 MB, ~5s | $0.000021 |
+| Nova Lite input: ~1K tokens @ $0.06/1M | $0.00006 |
+| Nova Lite output: ~500 tokens @ $0.24/1M | $0.00012 |
 
-#### Optimized Cost Per Screening
+**Cost per screening: ~$0.0002 (₹0.017)**
 
-| Component | Optimized Cost (INR) |
-|-----------|---------------------|
-| Amazon Connect (IVR) | ₹9.41 |
-| Lambda Functions (All) | ₹0.15 |
-| SMS Delivery (Local) | ₹0.23 |
-| Storage & Data | ₹0.06 |
-| **Optimized Total** | **₹9.85** |
+### 6. Get Screening Lambda + API Gateway
 
-## 💡 Business Model Viability
+| Component | Detail |
+|-----------|--------|
+| Lambda: 128 MB, ~0.2s, ~10 polls | $0.000004 |
+| API Gateway HTTP: $1/million requests × 10 | $0.00001 |
 
-### Break-even Analysis
+**Cost per screening: ~$0.00002 (₹0.002)**
 
-**Monthly Infrastructure Costs at Scale:**
-- 5,000 screenings: ₹49,250/month
-- 10,000 screenings: ₹98,500/month  
-- 25,000 screenings: ₹2,46,250/month
-- 50,000 screenings: ₹4,92,500/month
+### 7. S3 Storage & Requests
 
-**Revenue Scenarios:**
-- **Conservative**: ₹12/screening → Break-even at 4,100 screenings
-- **Realistic**: ₹15/screening → Break-even at 3,300 screenings
-- **Optimistic**: ₹20/screening → Break-even at 2,500 screenings
+| Item | Cost |
+|------|------|
+| WAV storage (~150 KB) | negligible |
+| JSON storage (~1 KB) | negligible |
+| PUT requests (2) | $0.00001 |
+| GET requests (model download, cached) | negligible |
 
-### Bootstrap ROI Projections
+**Cost per screening: ~$0.00001 (₹0.001)**
 
-**Month 6**: 4,000 screenings/month
-- Revenue: ₹60,000/month (₹15/screening)
-- Costs: ₹39,400/month
-- **Profit**: ₹20,600/month ✅
+### 8. DynamoDB
 
-**Month 12**: 12,000 screenings/month
-- Revenue: ₹1,80,000/month
-- Costs: ₹1,18,200/month
-- **Profit**: ₹61,800/month
+| Operation | Count | Cost |
+|-----------|-------|------|
+| Write (1 WCU each) | 4 (1 put + 3 updates) | $0.00000500 |
+| Read (1 RCU each) | ~10 (polling) | $0.00000250 |
 
-**Month 18**: 30,000 screenings/month
-- Revenue: ₹4,50,000/month
-- Costs: ₹2,95,500/month
-- **Profit**: ₹1,54,500/month (₹18.5 lakhs annually)
+**Cost per screening: ~$0.000008 (₹0.001)**
 
-## 🚀 Bootstrap Advantages
+### 9. CloudFront
 
-### Minimal Capital Requirements
-- **Total 18-month infrastructure cost**: ₹13,02,518 (~$15,800)
-- **No minimum charges**: Pay only for actual usage
-- **Instant scaling**: From 0 to 1000+ requests automatically
+| Item | Cost |
+|------|------|
+| Data transfer (static assets, cached) | negligible per request |
+| WebSocket proxy data (~1 MB/session) | ~$0.00008 |
+| HTTPS requests | ~$0.00001 |
 
-### Competitive Advantages
-- **Low operational costs**: Can offer competitive pricing
-- **Fast iteration**: Deploy updates in seconds
-- **No vendor lock-in**: Standard Lambda functions
-- **High availability**: 99.9% uptime with AWS
+**Cost per screening: ~$0.0001 (₹0.008)**
 
-## 🎯 Funding Requirements
+### 10. DynamoDB Streams
 
-### Bootstrap Capital (Infrastructure Only)
-- **Phase 1 (Hackathon)**: ₹2,558
-- **Phase 2 (Pilot - 3 months)**: ₹1,28,538  
-- **Phase 3 (Scale - 6 months)**: ₹11,71,422
-- **Total Bootstrap Capital**: ₹13,02,518 (~$15,800)
+| Item | Cost |
+|------|------|
+| Read requests (4 stream records) | $0.000008 |
 
-### Revenue-Based Growth Timeline
-**Month 6**: Break-even achieved at 4,000 screenings
-**Month 12**: ₹61,800/month profit (team can take salaries)
-**Month 18**: ₹1,54,500/month profit (₹18.5L annually)
+**Cost per screening: ~$0.00001 (₹0.001)**
 
-### Funding Sources
-1. **Hackathon Prize Money**: ₹2,00,000-5,00,000
-2. **AWS Startup Credits**: $5,000-10,000 (₹4-8 lakhs)
-3. **Personal Investment**: ₹3,00,000 (team contribution)
-4. **Small Angel Round**: ₹8,00,000-12,00,000
-5. **Government Grants**: ₹3,00,000-8,00,000 (BIRAC, DST)
+---
 
-## 📈 Scaling Economics
+## Total Per-Screening Cost
 
-### Volume Discounts & Optimizations
+| Component | Cost (USD) | Cost (INR) | % of Total |
+|-----------|-----------|-----------|------------|
+| Nova Sonic (3-min voice) | $0.0500 | ₹4.130 | 97.1% |
+| S3 + DynamoDB + Streams | $0.0001 | ₹0.005 | 0.1% |
+| Audio Predictor Lambda | $0.0001 | ₹0.012 | 0.3% |
+| Cough Predictor Lambda | $0.0000 | ₹0.002 | 0.0% |
+| Aggregator + Nova Lite | $0.0002 | ₹0.017 | 0.4% |
+| Get Screening + API GW | $0.0000 | ₹0.002 | 0.0% |
+| CloudFront | $0.0001 | ₹0.008 | 0.2% |
+| **Variable Total** | **$0.0515** | **₹4.25** | **100%** |
 
-**At 50,000+ screenings/month:**
-- AWS Enterprise Support: 10-15% discount
-- Reserved Lambda capacity: 20% savings
-- Direct carrier SMS integration: 50% SMS cost reduction
-- **Target cost**: ₹6-7 per screening
+> Nova Sonic dominates the per-screening cost at ~97%.
 
-**At 100,000+ screenings/month:**
-- Custom AWS pricing: 20-30% discount
-- Dedicated infrastructure: Further optimizations
-- **Target cost**: ₹4-5 per screening
+---
 
-### Revenue Optimization Strategies
-- **Government contracts**: ₹12-18 per screening
-- **Insurance partnerships**: ₹20-30 per screening
-- **Corporate CSR programs**: ₹15-25 per screening
-- **Direct consumer**: ₹10-15 per screening
+## Monthly Cost Projections (Variable + Fixed)
 
-## � Risk Mitigation
+| Volume | Nova Sonic | Lambdas | S3/DDB | ECS Fargate | ALB ($0.0225/hr + LCU) | CloudFront | **Total** |
+|--------|-----------|---------|--------|-------------|------------------------|------------|-----------|
+| 100/mo | $5.00 | $0.04 | $0.01 | $36.04 | $16.50 | $0.01 | **$57.60** |
+| 500/mo | $25.00 | $0.18 | $0.05 | $36.04 | $16.50 | $0.05 | **$77.82** |
+| 1,000/mo | $50.00 | $0.37 | $0.10 | $36.04 | $16.50 | $0.10 | **$103.11** |
+| 5,000/mo | $250.00 | $1.83 | $0.50 | $36.04 | $16.50 | $0.50 | **$305.37** |
+| 10,000/mo | $500.00 | $3.65 | $1.00 | $36.04 | $16.50 | $1.00 | **$558.19** |
 
-### Technical Risks
-- **Lambda cold starts**: Use provisioned concurrency for peak hours
-- **SMS delivery failures**: Multiple provider fallbacks
-- **Audio quality issues**: Robust validation and retry logic
+### Fixed Monthly Costs (regardless of volume)
 
-### Business Risks
-- **Regulatory changes**: 20% cost buffer for compliance
-- **Competition**: Focus on rural market differentiation
-- **Adoption rate**: Conservative growth projections
+| Service | Monthly Cost |
+|---------|-------------|
+| ECS Fargate (1 vCPU, 2 GB, 24/7) | $36.04 |
+| ALB (base hourly charge) | $16.43 |
+| CloudWatch Logs | ~$2.00 |
+| S3 storage (cumulative) | ~$0.50 |
+| **Fixed Total** | **~$55/month** |
 
-### Cost Control Measures
-- **Real-time monitoring**: CloudWatch cost alerts
-- **Usage optimization**: Automatic scaling policies
-- **Regular audits**: Monthly cost analysis and optimization
+---
 
-## 🎉 Summary
+## Cost Per Screening at Scale
 
-### Key Metrics
-- **Infrastructure cost per screening**: ₹9.85
-- **Break-even point**: 3,300 screenings/month
-- **Time to profitability**: 6 months
-- **18-month bootstrap cost**: ₹13 lakhs
-- **Annual profit potential**: ₹18+ lakhs by month 18
+| Monthly Volume | Variable/screening | Fixed/screening | **Total/screening** |
+|---------------|-------------------|-----------------|---------------------|
+| 100 | $0.051 | $0.550 | **$0.601 (₹49.6)** |
+| 500 | $0.051 | $0.110 | **$0.161 (₹13.3)** |
+| 1,000 | $0.051 | $0.055 | **$0.106 (₹8.8)** |
+| 5,000 | $0.051 | $0.011 | **$0.062 (₹5.1)** |
+| 10,000 | $0.051 | $0.006 | **$0.057 (₹4.7)** |
 
-### Success Factors
-✅ **Ultra-low infrastructure costs** enable competitive pricing  
-✅ **Serverless architecture** provides automatic scaling  
-✅ **Pay-per-use model** minimizes risk and waste  
-✅ **Fast deployment** enables rapid iteration  
-✅ **No vendor lock-in** provides flexibility  
+> At 1,000+ screenings/month, cost drops below ₹9 per screening.
+> At 5,000+, it approaches the theoretical minimum of ~₹4.25 (Nova Sonic floor).
 
-**The Lambda-first architecture makes BharatVani highly viable for bootstrap funding and rapid scaling!** 🚀
+---
+
+## Hackathon Demo Cost Estimate
+
+For a 48-hour hackathon with ~50 demo screenings:
+
+| Item | Cost |
+|------|------|
+| ECS Fargate (2 days) | $2.35 |
+| ALB (2 days) | $1.08 |
+| Nova Sonic (50 × $0.05) | $2.50 |
+| Lambdas (50 calls) | $0.02 |
+| S3 + DynamoDB | $0.01 |
+| CloudFront | $0.01 |
+| **Total hackathon cost** | **~$6 (₹495)** |
+
+---
+
+## Key Insights
+
+1. **Nova Sonic is 97% of variable cost** — the ML pipeline (Lambdas, Nova Lite, storage) is essentially free at this scale.
+
+2. **ECS Fargate is the main fixed cost** — $36/month for a single always-on task. Could be reduced by:
+   - Scaling to zero when idle (but adds cold start latency)
+   - Using Fargate Spot (~70% discount) for non-production
+   - Moving to EC2 t3.micro (~$8/month) for low-traffic scenarios
+
+3. **ALB adds $16/month fixed** — could be eliminated by connecting directly to ECS public IP (already supported via `?ecs_ip=` query param), but loses health checks and stable DNS.
+
+4. **Nova Lite (aggregator LLM) is negligible** — at $0.06/1M input tokens, it costs fractions of a cent per call.
+
+5. **Lambda free tier covers early usage** — 400K GB-seconds/month free means the first ~50K screenings/month have zero Lambda compute cost.
+
+---
+
+## Comparison: BharatVani vs Traditional Telehealth
+
+| Metric | BharatVani | Traditional IVR + Doctor |
+|--------|-----------|-------------------------|
+| Cost per screening | ₹4.25–₹50 | ₹200–₹500 |
+| Setup cost | ~₹500 (hackathon) | ₹5–10 lakhs |
+| Monthly fixed | ₹4,500 | ₹50,000+ |
+| Scaling | Automatic | Manual staffing |
+| Languages | Hindi + English (AI) | Per-agent |
+| Availability | 24/7 | Business hours |
+
+---
+
+*Pricing based on AWS us-east-1 on-demand rates. Sources: [AWS Fargate Pricing](https://aws.amazon.com/fargate/pricing/), [AWS Lambda Pricing](https://aws.amazon.com/lambda/pricing/), [Amazon Nova Pricing](https://aws.amazon.com/nova/pricing/), [AWS Bedrock Pricing](https://aws.amazon.com/bedrock/pricing/). Nova Sonic pricing from published rates (~$0.017/min). Content rephrased for compliance with licensing restrictions.*

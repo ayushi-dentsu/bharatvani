@@ -1,21 +1,56 @@
-terraform/credentials.json
-
 # Virtual environment
 venv/
+__pycache__/
+*.pyc
 
-# ML deployment artifacts
-ml/cough-predictor/
-ml/function.zip
-ml/function.zip.zip
-# datasets
-data/
-datasets/
-*.wav
-*.zip
-*.tar
-*.gz
+# Node
+node_modules/
+dashboard/node_modules/
+dashboard/build/
 
 # ML artifacts
 models/
 checkpoints/
-data/coughvid/
+data/
+datasets/
+*.zip
+*.tar
+*.gz
+*.whl
+
+# Vendored Python packages in ml/cough-predictor (only lambda_function.py matters)
+ml/cough-predictor/bin/
+ml/cough-predictor/joblib/
+ml/cough-predictor/joblib-*/
+ml/cough-predictor/numpy/
+ml/cough-predictor/numpy-*/
+ml/cough-predictor/numpy.libs/
+ml/cough-predictor/scikit_learn-*/
+ml/cough-predictor/scipy/
+ml/cough-predictor/scipy-*/
+ml/cough-predictor/scipy.libs/
+ml/cough-predictor/sklearn/
+ml/cough-predictor/threadpoolctl*
+ml/cough-predictor/*.whl/
+ml/cough-predictor/xgboost/
+ml/cough-predictor/xgboost-*/
+
+# Terraform state & credentials
+terraform/.terraform/
+terraform/tfplan
+terraform/credentials.json
+terraform/*.tfstate*
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+
+# Audio test files
+*.wav
+
+# Old/unused directories
+terraform/
+client/
+respiratory-ml/

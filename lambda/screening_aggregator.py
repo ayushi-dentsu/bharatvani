@@ -3,13 +3,14 @@ import os
 import boto3
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 lambda_client = boto3.client("lambda", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
 TABLE_NAME = os.environ.get("SCREENING_TABLE", "bharatvani-screenings")
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
 
 
 def _build_prompt(intake: dict, cough_result: dict, audio_result: dict) -> str:
@@ -56,20 +57,25 @@ Respond ONLY with valid JSON (no markdown, no extra text):
 
 
 def _call_bedrock(prompt: str) -> dict:
-    """Invoke Bedrock Claude to aggregate and decorate the screening outputs."""
+    """Invoke Bedrock Nova Lite to aggregate and decorate the screening outputs."""
     response = bedrock.invoke_model(
         modelId=MODEL_ID,
         contentType="application/json",
         accept="application/json",
         body=json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1024,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": {"maxTokens": 1024, "temperature": 0.2},
         }),
     )
     body = json.loads(response["body"].read())
-    text = body["content"][0]["text"]
+    text = body["output"]["message"]["content"][0]["text"]
+    # Strip markdown code fences if present
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
     return json.loads(text)
 
 
@@ -85,6 +91,17 @@ def _is_pipeline_complete(record: dict) -> bool:
     return all(k in record for k in ("ecs_output", "cough_result", "audio_result"))
 
 
+def _convert_floats(obj):
+    """Recursively convert floats to Decimal for DynamoDB compatibility."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _convert_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_floats(i) for i in obj]
+    return obj
+
+
 def _save_assessment(screening_id: str, intake: dict, assessment: dict) -> None:
     """Write the final aggregated report back to DynamoDB."""
     table = dynamodb.Table(TABLE_NAME)
@@ -94,10 +111,10 @@ def _save_assessment(screening_id: str, intake: dict, assessment: dict) -> None:
                          "confidence = :c, summary = :sum, urgency = :u, "
                          "patientName = :n, aggregatedAt = :t",
         ExpressionAttributeValues={
-            ":a": assessment,
+            ":a": _convert_floats(assessment),
             ":r": assessment["riskLevel"],
-            ":s": assessment["riskScore"],
-            ":c": assessment["confidence"],
+            ":s": Decimal(str(assessment["riskScore"])),
+            ":c": Decimal(str(assessment["confidence"])),
             ":sum": assessment["summary"],
             ":u": assessment["urgency"],
             ":n": intake.get("name", "Unknown"),

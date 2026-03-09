@@ -603,12 +603,9 @@ class BedrockStreamManager:
 
 # ─── ConversationManager ─────────────────────────────────────────────────────
 class ConversationManager:
-    SYSTEM_PROMPT = (
+    SYSTEM_PROMPT_BASE = (
         "You are a warm, professional, and helpful male AI assistant conducting a health intake for BharatVani, "
         "a rural health screening system in India. You collect patient information one question at a time through voice conversation.\n\n"
-        "CRITICAL LANGUAGE MIRRORING RULES:\n"
-        "- Always reply in the language spoken. DO NOT mix with English. However, if the user talks in English, reply in English.\n"
-        "- Please respond in the language the user is talking to you in.\n\n"
         "YOUR ROLE:\n"
         "- The app will instruct you to say specific questions. Say exactly what is instructed, nothing more.\n"
         "- When the user answers, accept their response and wait for the next instruction from the app.\n"
@@ -622,6 +619,22 @@ class ConversationManager:
         "User: Ayushi Shrivastava\n"
         "You: (wait silently for next instruction from app)"
     )
+    SYSTEM_PROMPT_ENGLISH = (
+        SYSTEM_PROMPT_BASE + "\n\n"
+        "CRITICAL LANGUAGE RULES:\n"
+        "- The user has chosen ENGLISH. You MUST speak and respond ONLY in English.\n"
+        "- Transcribe all user speech in English using the Latin alphabet. Do NOT use Devanagari or any other script.\n"
+        "- Even if the user has an Indian accent, always transcribe their words in English.\n"
+        "- Never switch to Hindi or any other language."
+    )
+    SYSTEM_PROMPT_HINDI = (
+        SYSTEM_PROMPT_BASE + "\n\n"
+        "CRITICAL LANGUAGE RULES:\n"
+        "- The user has chosen HINDI. You MUST speak and respond ONLY in Hindi.\n"
+        "- Transcribe all user speech in Hindi using Devanagari script.\n"
+        "- Never switch to English or any other language."
+    )
+    SYSTEM_PROMPT = SYSTEM_PROMPT_BASE  # default for language selection phase
     MAX_RETRIES = 2
     COUGH_DURATION = 8
 
@@ -700,10 +713,11 @@ class ConversationManager:
                 if choice:
                     self.language = choice
                     log_info(f"Language selected: {self.language}")
-                    # Close and reopen session to prevent model from adding commentary
+                    # Close and reopen session with language-specific prompt
                     await self.nova.close_session()
                     await asyncio.sleep(0.3)
-                    await self.nova.open_session(self.SYSTEM_PROMPT)
+                    prompt = self.SYSTEM_PROMPT_HINDI if self.language == "Hindi" else self.SYSTEM_PROMPT_ENGLISH
+                    await self.nova.open_session(prompt)
                     if self.language == "Hindi":
                         await self._speak("You selected Hindi. Let us begin.", "आपने हिंदी चुनी है। चलिए शुरू करते हैं।")
                     else:
@@ -847,7 +861,8 @@ class ConversationManager:
                 self.answers[q.key] = value
                 log_info(f"  → {q.key} = {value}")
             await self._cough_phase()
-            await self.nova.open_session(self.SYSTEM_PROMPT)
+            prompt = self.SYSTEM_PROMPT_HINDI if self.language == "Hindi" else self.SYSTEM_PROMPT_ENGLISH
+            await self.nova.open_session(prompt)
             await self._speak(
                 "Thank you. Your health intake is complete.",
                 "धन्यवाद। आपका स्वास्थ्य सेवन पूरा हो गया है।",
@@ -958,10 +973,9 @@ async def main():
         loop.add_signal_handler(sig, _signal_handler)
 
     # Health check handler for ECS — responds to plain HTTP with 200
-    async def health_check(path, request_headers):
-        if path == "/health":
-            return (200, [], b"OK\n")
-        return None
+    async def health_check(connection, request):
+        if request.path == "/health":
+            return connection.respond(200, "OK\n")
 
     async with websockets.serve(
         handle_connection, "0.0.0.0", PORT,

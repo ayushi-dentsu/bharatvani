@@ -8,7 +8,7 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 FUNCTION_NAME="${FUNCTION_NAME:-bharatvani-screening-aggregator}"
 SCREENING_TABLE="${SCREENING_TABLE:-bharatvani-screenings}"
-BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-anthropic.claude-3-haiku-20240307-v1:0}"
+BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-amazon.nova-lite-v1:0}"
 ROLE_NAME="${FUNCTION_NAME}-role"
 
 echo "==> Deploying ${FUNCTION_NAME} to ${AWS_REGION} (account ${ACCOUNT_ID})"
